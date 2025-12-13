@@ -7,7 +7,7 @@
 
 - 🤖 **Bot 管理**：所有任务和账号管理都通过一个 Bot 完成
 - 👥 **多账号支持**：可同时登录多个 Telegram 个人号
-- ⏰ **灵活定时**：基于 Cron 表达式（上海时区）
+- ⏰ **灵活定时**：支持 6 字段 Cron（含秒）或 `100s/36h` 间隔表达式（上海时区）
 - 📝 **任务备注**：每个任务可带备注，方便区分
 - 📊 **状态监控**：随时查看账号实时状态（在线/离线/最近上线）
 - 🔐 **独立运行环境**：自动创建虚拟环境，依赖与系统隔离
@@ -73,14 +73,14 @@ bash manage.sh update    # 从仓库更新到 /opt 并重启
 
 ### 任务管理
 ```
-/addtask 目标 | CRON | 文本 | 账号别名 | 备注
-  示例: /addtask @MyCheckinBot | 0 9 * * * | /checkin | myA | 早安签到
-
-/listtasks                         # 列出任务
-/deltask ID                        # 删除任务
-/toggle ID                         # 启用/停用任务
-/test 目标 | 文本 | 账号别名        # 立即测试一次
+/addtask 目标 | CRON/间隔 | 文本(多条用||) | 账号别名 | 备注 | 消息延迟s(-=无) | 发言ID(-=本账号)
+/edittask ID | 目标 | CRON/间隔 | 文本(多条用||) | 账号别名 | 备注 | 消息延迟s(-=无) | 发言ID(-=本账号)
+/listtasks
+/deltask ID
+/toggle ID
+/test 目标 | 文本 | 账号别名 | 消息延迟s(-=无) | 发言ID(-=本账号)
 ```
+> CRON 支持 6 字段（秒 分 时 日 月 周），也可直接写 `100s` / `380m` / `36h` 表示每隔一定秒/分/小时执行一次。
 
 ### 状态与查询
 ```
@@ -91,11 +91,29 @@ bash manage.sh update    # 从仓库更新到 /opt 并重启
 
 ---
 
-## ⏱ CRON 表达式
+## 🐳 Docker 部署
 
-所有定时任务使用 **上海时区 (Asia/Shanghai)**，示例：
-- `0 9 * * *` → 每天早上 09:00  
-- `*/10 * * * *` → 每 10 分钟执行一次  
+也可以通过 Docker 运行（初次会根据环境变量生成 `config.json`）。提供脚本 `./docker-install.sh`，会交互式询问 `API_ID`/`API_HASH`/`BOT_TOKEN`/`ADMIN_IDS` 及数据目录，然后执行 `docker build` + `docker run`。
+
+也可手动执行（等同于脚本步骤）：
+
+```bash
+docker build -t tg-checkin-bot .
+docker run -d --name tg-checkin \
+  -e API_ID=123456 \
+  -e API_HASH=your_api_hash \
+  -e BOT_TOKEN=123456:abcDEFghIJKLmno \
+  -e ADMIN_IDS=111111111,222222222 \
+  -v $(pwd)/data:/data \
+  tg-checkin-bot
+```
+
+- `API_ID` / `API_HASH`：在 [my.telegram.org](https://my.telegram.org) 申请  
+- `BOT_TOKEN`：@BotFather 下发  
+- `ADMIN_IDS`：逗号分隔的 Telegram 用户 ID  
+- `/data` 用于持久化 `config.json`、`accounts.json`、`tasks.json`、`*.session`，请绑定到宿主目录
+
+容器日志可通过 `docker logs -f tg-checkin` 查看，其余命令与裸机部署相同。
 
 ---
 

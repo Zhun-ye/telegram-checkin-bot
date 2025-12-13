@@ -3,10 +3,10 @@
 """
 tg-auto-checkin: 多账号 + Bot 管理 + 个人号发送 + 定时（上海时区）
 - 多账号：/adduser /code /pass /listusers /removeuser
-- 任务：/addtask /listtasks /deltask /toggle /test
+- 任务：/addtask /edittask /listtasks /deltask /toggle /test
 - 实时：/status（全部账号） /me <alias> /whois <target>
-- CRON：5字段 crontab；时区 Asia/Shanghai
-- 任务字段：target/cron/message/account/remark/enabled
+- CRON：6字段 crontab（含秒）或间隔表达式（100s/380m/36h）；时区 Asia/Shanghai
+- 任务字段：target/cron/messages/account/remark/delay/send_as/enabled
 依赖：telethon, apscheduler（自动安装，兼容 PEP 668）
 数据：config.json / accounts.json / tasks.json
 会话文件：user-<alias>.session（个人号），bot.session（机器人）
@@ -15,6 +15,7 @@ tg-auto-checkin: 多账号 + Bot 管理 + 个人号发送 + 定时（上海时�
 import asyncio
 import json
 import os
+import re
 import sys
 import subprocess
 from datetime import datetime
@@ -45,6 +46,7 @@ from telethon.errors import SessionPasswordNeededError
 from telethon.tl.types import UserStatusOnline, UserStatusOffline
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from zoneinfo import ZoneInfo  # Python3.9+
 
 # ---------------- 常量/文件 ----------------
@@ -53,6 +55,17 @@ ACCOUNTS = Path("accounts.json")
 TASKS = Path("tasks.json")
 BOT_SESSION = "bot"  # 机器人会话
 SH_TZ = ZoneInfo("Asia/Shanghai")
+FIELD_PLACEHOLDER = "-"  # 命令中未设置字段的占位符
+INTERVAL_KEYWORD_MAP = {
+    "s": "seconds", "sec": "seconds", "secs": "seconds", "second": "seconds", "seconds": "seconds",
+    "秒": "seconds", "秒钟": "seconds",
+    "m": "minutes", "min": "minutes", "mins": "minutes", "minute": "minutes", "minutes": "minutes",
+    "分": "minutes", "分钟": "minutes",
+    "h": "hours", "hr": "hours", "hrs": "hours", "hour": "hours", "hours": "hours",
+    "时": "hours", "小时": "hours",
+}
+INTERVAL_KEYWORD_PATTERN = "|".join(sorted([re.escape(k) for k in INTERVAL_KEYWORD_MAP.keys()], key=len, reverse=True))
+INTERVAL_REGEX = re.compile(rf"^\\s*(\\d+)\\s*({INTERVAL_KEYWORD_PATTERN})\\s*$", re.IGNORECASE)
 
 # ---------------- 基础工具 ----------------
 def load_json(path: Path, default):
@@ -81,9 +94,24 @@ def prompt(label, default=None):
         return prompt(label, default)
     return val
 
-def parse_cron(expr: str) -> CronTrigger:
-    # 5 字段 crontab，调度器采用上海时区
-    return CronTrigger.from_crontab(expr, timezone=SH_TZ)
+def parse_schedule(expr: str):
+    """支持 6 字段 cron 或 `100s`/`380m`/`36h` 这类间隔表达式。"""
+    expr = (expr or "").strip()
+    if not expr:
+        raise ValueError("CRON/间隔表达式不能为空")
+    m = INTERVAL_REGEX.match(expr)
+    if m:
+        value = int(m.group(1))
+        unit_key = m.group(2).lower()
+        unit = INTERVAL_KEYWORD_MAP[unit_key]
+        if value <= 0:
+            raise ValueError("间隔必须大于 0")
+        kwargs = {unit: value}
+        return IntervalTrigger(timezone=SH_TZ, **kwargs)
+    try:
+        return CronTrigger.from_crontab(expr, timezone=SH_TZ, with_seconds=True)
+    except ValueError:
+        return CronTrigger.from_crontab(expr, timezone=SH_TZ)
 
 def fmt_entity(ent):
     name = getattr(ent, "title", None) or \
@@ -109,6 +137,19 @@ async def resolve_entity(client: TelegramClient, t: str):
                 return ent
         raise ValueError(f"无法通过数字ID {t} 找到对象；请先与其建立会话，或改用 @用户名 / t.me 链接 / -100群ID。")
     return await client.get_entity(t)
+
+async def resolve_send_as(client: TelegramClient, target):
+    if target in (None, "", FIELD_PLACEHOLDER):
+        peer = "me"
+    else:
+        txt = str(target).strip()
+        if not txt:
+            peer = "me"
+        elif txt.lstrip("-").isdigit():
+            peer = int(txt)
+        else:
+            peer = txt
+    return await client.get_input_entity(peer)
 
 # ---------------- 配置与状态 ----------------
 def ensure_config():
@@ -140,9 +181,55 @@ def ensure_tasks():
     save_json(TASKS, data)
     return data
 
+def normalize_task_entry(task: dict) -> bool:
+    changed = False
+    msgs_missing = "messages" not in task
+    msgs = task.get("messages")
+    if not isinstance(msgs, list) or not msgs:
+        legacy = task.get("message")
+        if legacy is None:
+            legacy = ""
+        msgs = [legacy]
+        changed = True
+    elif msgs_missing:
+        changed = True
+    normalized_msgs = [str(m) for m in msgs]
+    if normalized_msgs != msgs:
+        changed = True
+    task["messages"] = normalized_msgs
+
+    delay_missing = "delay" not in task
+    delay_raw = task.get("delay", 0)
+    try:
+        delay_val = max(0, int(delay_raw))
+    except Exception:
+        delay_val = 0
+    if delay_val != delay_raw or delay_missing:
+        changed = True
+    task["delay"] = delay_val
+
+    send_as_missing = "send_as" not in task
+    send_as_raw = task.get("send_as")
+    if send_as_raw is None and "reply_to" in task:
+        send_as_raw = task.pop("reply_to")
+        changed = True
+    if send_as_raw is None:
+        send_as_val = None
+    else:
+        send_as_txt = str(send_as_raw).strip()
+        if not send_as_txt or send_as_txt == FIELD_PLACEHOLDER:
+            send_as_val = None
+        else:
+            send_as_val = send_as_txt
+    if send_as_missing or task.get("send_as") != send_as_val:
+        task["send_as"] = send_as_val
+        changed = True
+    return changed
+
 # 运行时客户端池：{alias: TelegramClient}
 CLIENTS: dict[str, TelegramClient] = {}
 PENDING: dict[int, dict] = {}  # 管理员对话中的登录流程状态 {admin_id: {"alias":..., "phone":...}}
+ACCOUNT_LOCKS: dict[str, asyncio.Lock] = {}
 
 # ---------------- 账号管理 ----------------
 def session_file_for(alias: str) -> str:
@@ -168,18 +255,39 @@ async def user_status(client: TelegramClient):
     return me, online, last
 
 # ---------------- 任务发送 ----------------
-async def send_with_user(api_id, api_hash, alias: str, target: str, text: str):
-    client = await get_or_start_client(api_id, api_hash, alias)
-    if not await client.is_user_authorized():
-        raise RuntimeError(f"账号 {alias} 未登录，请先在 Bot 中完成 /adduser → /code（→ /pass）流程。")
-    ent = await resolve_entity(client, target)
-    await client.send_message(ent, text)
+async def send_with_user(api_id, api_hash, alias: str, target: str, texts, delay=0, send_as=None):
+    lock = ACCOUNT_LOCKS.setdefault(alias, asyncio.Lock())
+    async with lock:
+        client = await get_or_start_client(api_id, api_hash, alias)
+        if not await client.is_user_authorized():
+            raise RuntimeError(f"账号 {alias} 未登录，请先在 Bot 中完成 /adduser → /code（→ /pass）流程。")
+        ent = await resolve_entity(client, target)
+        if isinstance(texts, str):
+            messages = [texts]
+        else:
+            messages = [str(x) for x in texts]
+        delay = max(0, int(delay or 0))
+        send_as_peer = await resolve_send_as(client, send_as)
+        for idx, text in enumerate(messages):
+            if not text:
+                continue
+            await client.send_message(ent, text, send_as=send_as_peer)
+            if delay and idx < len(messages) - 1:
+                await asyncio.sleep(delay)
+        if delay and messages:
+            await asyncio.sleep(delay)
 
 # ---------------- 主流程 ----------------
 async def main():
     cfg = ensure_config()
     acc = ensure_accounts()
     tasks_state = ensure_tasks()
+    upgraded = False
+    for t in tasks_state["tasks"]:
+        if normalize_task_entry(t):
+            upgraded = True
+    if upgraded:
+        save_json(TASKS, tasks_state)
 
     # 机器人
     bot = TelegramClient(BOT_SESSION, cfg["api_id"], cfg["api_hash"])
@@ -193,11 +301,20 @@ async def main():
     def add_job_from_task(t):
         if not t.get("enabled", True):
             return
-        trig = parse_cron(t["cron"])
+        normalize_task_entry(t)
+        trig = parse_schedule(t["cron"])
         scheduler.add_job(
             send_with_user,
             trigger=trig,
-            args=[cfg["api_id"], cfg["api_hash"], t["account"], t["target"], t["message"]],
+            args=[
+                cfg["api_id"],
+                cfg["api_hash"],
+                t["account"],
+                t["target"],
+                t["messages"],
+                t.get("delay", 0),
+                t.get("send_as"),
+            ],
             id=str(t["id"]),
             replace_existing=True,
             coalesce=True,
@@ -219,11 +336,13 @@ async def main():
         return (
             "🧭 *签到机器人 · 管理菜单*\n"
             "—— *任务管理* ——\n"
-            "`/addtask` 目标 `|` CRON `|` 文本 `|` 账号别名 `|` 备注\n"
+            "`/addtask` 目标 `|` CRON `|` 文本(多条用`||`) `|` 账号别名 `|` 备注 `|` 消息延迟(`-`=无延迟) `|` 发言ID(`-`=本账号)\n"
+            "`/edittask` ID `|` 目标 `|` CRON/间隔 `|` 文本(多条用`||`) `|` 账号别名 `|` 备注 `|` 消息延迟(`-`=无) `|` 发言ID(`-`=本账号)\n"
             "`/listtasks`  列出任务\n"
             "`/deltask` ID 删除任务\n"
             "`/toggle` ID 启/停任务\n"
-            "`/test` 目标 `|` 文本 `|` 账号别名  立即测试一次\n\n"
+            "`/test` 目标 `|` 文本(多条用`||`) `|` 账号别名 `|` 消息延迟(`-`=无延迟) `|` 发言ID(`-`=本账号)  立即测试\n"
+            "_占位符 `-` 表示不设置；发言ID 为空会自动使用该账号自身 ID，可使用频道发言；消息延迟=多条消息之间等待时间_\n\n"
             "—— *账号管理* ——\n"
             "`/adduser` 别名 `|` 手机号(含国家码)\n"
             "`/code`   别名 `|` 验证码\n"
@@ -235,9 +354,10 @@ async def main():
             "`/me` 别名       查看某账号登录信息\n"
             "`/whois` 目标     解析目标信息\n\n"
             "*CRON 示例*\n"
-            "`0 9 * * *`  每天 09:00（上海时区）\n"
-            "`*/10 * * * *`  每 10 分钟\n"
-            "_目标可用：@用户名 / t.me 链接 / -100群ID / 数字用户ID（需在会话列表） / me_\n"
+            "`0 0 9 * * *`  每天 09:00（秒 分 时 日 月 周）\n"
+            "`30 */10 * * * *`  每 10 分钟执行，并在周期内第 30 秒触发\n"
+            "`100s` / `380m` / `36h`  表示纯间隔定时（秒/分钟/小时）\n"
+            "_支持 6 字段（含秒）的 cron 表达式，也兼容 `100s` 这类间隔格式（单位：s/m/h）；目标可用：@用户名 / t.me 链接 / -100群ID / 数字用户ID（需在会话列表） / me_\n"
         )
 
     @bot.on(events.NewMessage(pattern=r"^/(start|help)$"))
@@ -345,25 +465,123 @@ async def main():
         if not admin_ok(e): return
         try:
             body = e.pattern_match.group(1).strip()
-            # 目标 | CRON | 文本 | 账号别名 | 备注
+            # 目标 | CRON | 文本 | 账号别名 | 备注 | 消息延迟s | 发言ID
             parts = [x.strip() for x in body.split("|")]
             if len(parts) < 4:
-                await e.reply("格式：`/addtask 目标 | CRON | 文本 | 账号别名 | 备注(可空)`", parse_mode="md"); return
-            target, cron_expr, text, alias = parts[0], parts[1], parts[2], parts[3]
+                await e.reply("格式：`/addtask 目标 | CRON | 文本 | 账号别名 | 备注 | 消息延迟s(-=不设) | 发言ID(-=自账号)`", parse_mode="md"); return
+            target, cron_expr, text_field, alias = parts[0], parts[1], parts[2], parts[3]
             remark = parts[4] if len(parts) >= 5 else ""
+            delay_txt = parts[5] if len(parts) >= 6 else ""
+            send_as_txt = parts[6] if len(parts) >= 7 else ""
+            messages = [m.strip() for m in text_field.split("||") if m.strip()]
+            if not messages:
+                await e.reply("消息内容不能为空，可用 `||` 分隔多条。", parse_mode="md"); return
+            delay_sec = 0
+            if delay_txt and delay_txt != FIELD_PLACEHOLDER:
+                if delay_txt.isdigit():
+                    delay_sec = max(0, int(delay_txt))
+                else:
+                    await e.reply("消息延迟s需为非负整数，或使用 `-` 表示不设置。", parse_mode="md"); return
+            send_as_val = None
+            if send_as_txt and send_as_txt != FIELD_PLACEHOLDER:
+                txt = send_as_txt.strip()
+                if txt.lstrip("-").isdigit():
+                    send_as_val = txt
+                else:
+                    await e.reply("发言ID 需为数字ID（或 `-` 表示自用）。", parse_mode="md"); return
             # 验证：cron & 账号存在
-            _ = parse_cron(cron_expr)
+            _ = parse_schedule(cron_expr)
             if alias not in ensure_accounts()["users"]:
                 await e.reply("账号别名不存在，请先 /listusers 查看或 /adduser 登陆。"); return
 
             tid = tasks_state["seq"]; tasks_state["seq"] += 1
-            task = {"id": tid, "target": target, "cron": cron_expr, "message": text,
-                    "account": alias, "remark": remark, "enabled": True}
+            task = {
+                "id": tid,
+                "target": target,
+                "cron": cron_expr,
+                "messages": messages,
+                "account": alias,
+                "remark": remark,
+                "delay": delay_sec,
+                "send_as": send_as_val,
+                "enabled": True,
+            }
             tasks_state["tasks"].append(task); save_json(TASKS, tasks_state)
             add_job_from_task(task)
-            await e.reply(f"✅ 已添加任务 #{tid}\n[{alias}] {cron_expr} -> {target}\n备注：{remark or '（无）'}")
+            summary = f"{len(messages)}条消息，消息延迟{delay_sec}s"
+            if send_as_val:
+                summary += f"，发言ID {send_as_val}"
+            else:
+                summary += "，发言ID=自账号"
+            await e.reply(f"✅ 已添加任务 #{tid}\n[{alias}] {cron_expr} -> {target}\n{summary}\n备注：{remark or '（无）'}")
         except Exception as ex:
             await e.reply(f"❌ 添加失败：{ex}")
+
+    @bot.on(events.NewMessage(pattern=r"^/edittask\s+(.+)"))
+    async def _(e):
+        if not admin_ok(e): return
+        try:
+            body = e.pattern_match.group(1).strip()
+            # ID | 目标 | CRON/间隔 | 文本 | 账号别名 | 备注 | 消息延迟s | 发言ID
+            parts = [x.strip() for x in body.split("|")]
+            if len(parts) < 5:
+                await e.reply("格式：`/edittask ID | 目标 | CRON | 文本 | 账号别名 | 备注 | 消息延迟s(-=不设) | 发言ID(-=自账号)`", parse_mode="md"); return
+            tid_txt, target, cron_expr, text_field, alias = parts[0], parts[1], parts[2], parts[3], parts[4]
+            remark = parts[5] if len(parts) >= 6 else task.get("remark", "")
+            delay_txt = parts[6] if len(parts) >= 7 else ""
+            send_as_txt = parts[7] if len(parts) >= 8 else ""
+            if not tid_txt.isdigit():
+                await e.reply("ID 必须是数字。"); return
+            tid = int(tid_txt)
+            task = next((x for x in tasks_state["tasks"] if x["id"] == tid), None)
+            if not task:
+                await e.reply("未找到该任务 ID。"); return
+            messages = [m.strip() for m in text_field.split("||") if m.strip()]
+            if not messages:
+                await e.reply("消息内容不能为空，可用 `||` 分隔多条。", parse_mode="md"); return
+            delay_sec = task.get("delay", 0)
+            if delay_txt:
+                if delay_txt != FIELD_PLACEHOLDER:
+                    if delay_txt.isdigit():
+                        delay_sec = max(0, int(delay_txt))
+                    else:
+                        await e.reply("消息延迟s需为非负整数，或使用 `-` 表示不设置。", parse_mode="md"); return
+            send_as_val = task.get("send_as")
+            if send_as_txt:
+                if send_as_txt != FIELD_PLACEHOLDER:
+                    txt = send_as_txt.strip()
+                    if txt.lstrip("-").isdigit():
+                        send_as_val = txt
+                    else:
+                        await e.reply("发言ID 需为数字ID（或 `-` 表示自用）。", parse_mode="md"); return
+                else:
+                    send_as_val = None
+            # 验证 cron & 账号
+            _ = parse_schedule(cron_expr)
+            if alias not in ensure_accounts()["users"]:
+                await e.reply("账号别名不存在，请先 /listusers 查看或 /adduser 登陆。"); return
+            task.update({
+                "target": target,
+                "cron": cron_expr,
+                "messages": messages,
+                "account": alias,
+                "remark": remark,
+                "delay": delay_sec,
+                "send_as": send_as_val,
+            })
+            normalize_task_entry(task)
+            save_json(TASKS, tasks_state)
+            try:
+                scheduler.remove_job(str(tid))
+            except Exception:
+                pass
+            add_job_from_task(task)
+            status = "ON" if task.get("enabled", True) else "OFF"
+            summary = f"{len(messages)}条消息，消息延迟{delay_sec}s，状态{status}"
+            summary += f"，发言ID {send_as_val}" if send_as_val else "，发言ID=本账号"
+            await e.reply(f"✅ 任务 #{tid} 已更新。\n[{alias}] {cron_expr} -> {target}\n{summary}")
+        except Exception as ex:
+            await e.reply(f"❌ 修改失败：{ex}")
 
     @bot.on(events.NewMessage(pattern=r"^/listtasks$"))
     async def _(e):
@@ -372,9 +590,17 @@ async def main():
             await e.reply("暂无任务。"); return
         lines = []
         for t in tasks_state["tasks"]:
-            lines.append(f"#{t['id']} [{'ON' if t.get('enabled', True) else 'OFF'}] "
-                         f"[{t['account']}] {t['cron']} -> {t['target']} | {t['message'][:40]} "
-                         f"｜备注:{(t.get('remark') or '无')}")
+            normalize_task_entry(t)
+            preview = t["messages"][0][:40] + ("..." if len(t["messages"][0]) > 40 else "")
+            extra = f" 共{len(t['messages'])}条" if len(t["messages"]) > 1 else ""
+            delay_val = t.get("delay", 0)
+            delay_txt = f" 消息延迟:{delay_val}s" if delay_val else ""
+            send_as_txt = f" 发言:{t['send_as']}" if t.get("send_as") else " 发言:自账号"
+            lines.append(
+                f"#{t['id']} [{'ON' if t.get('enabled', True) else 'OFF'}] "
+                f"[{t['account']}] {t['cron']} -> {t['target']} | {preview}{extra}{delay_txt}{send_as_txt} "
+                f"｜备注:{(t.get('remark') or '无')}"
+            )
         await e.reply("📋 任务列表：\n" + "\n".join(lines))
 
     @bot.on(events.NewMessage(pattern=r"^/deltask\s+(\d+)"))
@@ -413,12 +639,30 @@ async def main():
         if not admin_ok(e): return
         try:
             body = e.pattern_match.group(1).strip()
-            # 目标 | 文本 | 账号别名
+            # 目标 | 文本 | 账号别名 | 消息延迟s | 发言ID
             parts = [x.strip() for x in body.split("|")]
-            if len(parts) != 3:
-                await e.reply("格式：`/test 目标 | 文本 | 账号别名`", parse_mode="md"); return
-            target, text, alias = parts
-            await send_with_user(cfg["api_id"], cfg["api_hash"], alias, target, text)
+            if len(parts) < 3:
+                await e.reply("格式：`/test 目标 | 文本 | 账号别名 | 消息延迟s(-=不设) | 发言ID(-=自账号)`", parse_mode="md"); return
+            target, text_field, alias = parts[0], parts[1], parts[2]
+            delay_txt = parts[3] if len(parts) >= 4 else ""
+            send_as_txt = parts[4] if len(parts) >= 5 else ""
+            messages = [m.strip() for m in text_field.split("||") if m.strip()]
+            if not messages:
+                await e.reply("消息内容不能为空，可用 `||` 分隔多条。", parse_mode="md"); return
+            delay_sec = 0
+            if delay_txt and delay_txt != FIELD_PLACEHOLDER:
+                if delay_txt.isdigit():
+                    delay_sec = max(0, int(delay_txt))
+                else:
+                    await e.reply("消息延迟s需为非负整数，或使用 `-` 表示不设置。", parse_mode="md"); return
+            send_as_val = None
+            if send_as_txt and send_as_txt != FIELD_PLACEHOLDER:
+                txt = send_as_txt.strip()
+                if txt.lstrip("-").isdigit():
+                    send_as_val = txt
+                else:
+                    await e.reply("发言ID 需为数字ID（或 `-` 表示自用）。", parse_mode="md"); return
+            await send_with_user(cfg["api_id"], cfg["api_hash"], alias, target, messages, delay_sec, send_as_val)
             await e.reply(f"✅ 已尝试发送（{alias}）")
         except Exception as ex:
             await e.reply(f"❌ 发送失败：{ex}")
