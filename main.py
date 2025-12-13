@@ -56,6 +56,8 @@ TASKS = Path("tasks.json")
 BOT_SESSION = "bot"  # 机器人会话
 SH_TZ = ZoneInfo("Asia/Shanghai")
 FIELD_PLACEHOLDER = "-"  # 命令中未设置字段的占位符
+SEND_AS_DISABLE = "__NO_SEND_AS__"
+SEND_AS_DISABLE_KEYWORDS = {"none", "no", "off", "0", "disable", "禁用"}
 INTERVAL_KEYWORD_MAP = {
     "s": "seconds", "sec": "seconds", "secs": "seconds", "second": "seconds", "seconds": "seconds",
     "秒": "seconds", "秒钟": "seconds",
@@ -150,6 +152,19 @@ async def resolve_send_as(client: TelegramClient, target):
         else:
             peer = txt
     return await client.get_input_entity(peer)
+
+async def ensure_send_as_permission(api_id, api_hash, alias: str, send_as_val):
+    if send_as_val in (None, SEND_AS_DISABLE):
+        return
+    client = await get_or_start_client(api_id, api_hash, alias)
+    if not await client.is_user_authorized():
+        raise RuntimeError(f"账号 {alias} 未登录，无法校验发言ID。")
+    me = await client.get_me()
+    if not getattr(me, "premium", False):
+        raise ValueError("该账号未开通 Telegram Premium，不能指定发言ID。")
+    ent = await resolve_entity(client, send_as_val)
+    if not getattr(ent, "creator", False):
+        raise ValueError("只有频道创建者才能设置此发言ID。")
 
 # ---------------- 配置与状态 ----------------
 def ensure_config():
@@ -267,11 +282,15 @@ async def send_with_user(api_id, api_hash, alias: str, target: str, texts, delay
         else:
             messages = [str(x) for x in texts]
         delay = max(0, int(delay or 0))
-        send_as_peer = await resolve_send_as(client, send_as)
+        send_kwargs = {}
+        if send_as == SEND_AS_DISABLE:
+            send_kwargs = {}
+        else:
+            send_kwargs = {"send_as": await resolve_send_as(client, send_as)}
         for idx, text in enumerate(messages):
             if not text:
                 continue
-            await client.send_message(ent, text, send_as=send_as_peer)
+            await client.send_message(ent, text, **send_kwargs)
             if delay and idx < len(messages) - 1:
                 await asyncio.sleep(delay)
         if delay and messages:
@@ -336,13 +355,13 @@ async def main():
         return (
             "🧭 *签到机器人 · 管理菜单*\n"
             "—— *任务管理* ——\n"
-            "`/addtask` 目标 `|` CRON `|` 文本(多条用`||`) `|` 账号别名 `|` 备注 `|` 消息延迟(`-`=无延迟) `|` 发言ID(`-`=本账号)\n"
-            "`/edittask` ID `|` 目标 `|` CRON/间隔 `|` 文本(多条用`||`) `|` 账号别名 `|` 备注 `|` 消息延迟(`-`=无) `|` 发言ID(`-`=本账号)\n"
+            "`/addtask` 目标 `|` CRON `|` 文本(多条用`||`) `|` 账号别名 `|` 备注 `|` 消息延迟(`-`=无延迟) `|` 发言ID(`-`=本账号/none=禁用)\n"
+            "`/edittask` ID `|` 目标 `|` CRON/间隔 `|` 文本(多条用`||`) `|` 账号别名 `|` 备注 `|` 消息延迟(`-`=无) `|` 发言ID(`-`=本账号/none=禁用)\n"
             "`/listtasks`  列出任务\n"
             "`/deltask` ID 删除任务\n"
             "`/toggle` ID 启/停任务\n"
             "`/test` 目标 `|` 文本(多条用`||`) `|` 账号别名 `|` 消息延迟(`-`=无延迟) `|` 发言ID(`-`=本账号)  立即测试\n"
-            "_占位符 `-` 表示不设置；发言ID 为空会自动使用该账号自身 ID，可使用频道发言；消息延迟=多条消息之间等待时间_\n\n"
+            "_占位符 `-` 表示不设置；发言ID=none 可禁用 send-as；消息延迟=多条消息之间等待时间_\n\n"
             "—— *账号管理* ——\n"
             "`/adduser` 别名 `|` 手机号(含国家码)\n"
             "`/code`   别名 `|` 验证码\n"
@@ -483,16 +502,22 @@ async def main():
                 else:
                     await e.reply("消息延迟s需为非负整数，或使用 `-` 表示不设置。", parse_mode="md"); return
             send_as_val = None
-            if send_as_txt and send_as_txt != FIELD_PLACEHOLDER:
+            if send_as_txt:
                 txt = send_as_txt.strip()
-                if txt.lstrip("-").isdigit():
+                low = txt.lower()
+                if txt == FIELD_PLACEHOLDER:
+                    send_as_val = None
+                elif low in SEND_AS_DISABLE_KEYWORDS:
+                    send_as_val = SEND_AS_DISABLE
+                elif txt.lstrip("-").isdigit():
                     send_as_val = txt
                 else:
-                    await e.reply("发言ID 需为数字ID（或 `-` 表示自用）。", parse_mode="md"); return
+                    await e.reply("发言ID 需为数字ID、`-`（本账号）或 `none`（禁用）。", parse_mode="md"); return
             # 验证：cron & 账号存在
             _ = parse_schedule(cron_expr)
             if alias not in ensure_accounts()["users"]:
                 await e.reply("账号别名不存在，请先 /listusers 查看或 /adduser 登陆。"); return
+            await ensure_send_as_permission(cfg["api_id"], cfg["api_hash"], alias, send_as_val)
 
             tid = tasks_state["seq"]; tasks_state["seq"] += 1
             task = {
@@ -509,7 +534,9 @@ async def main():
             tasks_state["tasks"].append(task); save_json(TASKS, tasks_state)
             add_job_from_task(task)
             summary = f"{len(messages)}条消息，消息延迟{delay_sec}s"
-            if send_as_val:
+            if send_as_val == SEND_AS_DISABLE:
+                summary += "，发言ID=禁用"
+            elif send_as_val:
                 summary += f"，发言ID {send_as_val}"
             else:
                 summary += "，发言ID=自账号"
@@ -548,18 +575,21 @@ async def main():
                         await e.reply("消息延迟s需为非负整数，或使用 `-` 表示不设置。", parse_mode="md"); return
             send_as_val = task.get("send_as")
             if send_as_txt:
-                if send_as_txt != FIELD_PLACEHOLDER:
-                    txt = send_as_txt.strip()
-                    if txt.lstrip("-").isdigit():
-                        send_as_val = txt
-                    else:
-                        await e.reply("发言ID 需为数字ID（或 `-` 表示自用）。", parse_mode="md"); return
-                else:
+                txt = send_as_txt.strip()
+                low = txt.lower()
+                if txt == FIELD_PLACEHOLDER:
                     send_as_val = None
+                elif low in SEND_AS_DISABLE_KEYWORDS:
+                    send_as_val = SEND_AS_DISABLE
+                elif txt.lstrip("-").isdigit():
+                    send_as_val = txt
+                else:
+                    await e.reply("发言ID 需为数字ID、`-`（本账号）或 `none`（禁用）。", parse_mode="md"); return
             # 验证 cron & 账号
             _ = parse_schedule(cron_expr)
             if alias not in ensure_accounts()["users"]:
                 await e.reply("账号别名不存在，请先 /listusers 查看或 /adduser 登陆。"); return
+            await ensure_send_as_permission(cfg["api_id"], cfg["api_hash"], alias, send_as_val)
             task.update({
                 "target": target,
                 "cron": cron_expr,
@@ -578,7 +608,12 @@ async def main():
             add_job_from_task(task)
             status = "ON" if task.get("enabled", True) else "OFF"
             summary = f"{len(messages)}条消息，消息延迟{delay_sec}s，状态{status}"
-            summary += f"，发言ID {send_as_val}" if send_as_val else "，发言ID=本账号"
+            if send_as_val == SEND_AS_DISABLE:
+                summary += "，发言ID=禁用"
+            elif send_as_val:
+                summary += f"，发言ID {send_as_val}"
+            else:
+                summary += "，发言ID=本账号"
             await e.reply(f"✅ 任务 #{tid} 已更新。\n[{alias}] {cron_expr} -> {target}\n{summary}")
         except Exception as ex:
             await e.reply(f"❌ 修改失败：{ex}")
@@ -595,7 +630,12 @@ async def main():
             extra = f" 共{len(t['messages'])}条" if len(t["messages"]) > 1 else ""
             delay_val = t.get("delay", 0)
             delay_txt = f" 消息延迟:{delay_val}s" if delay_val else ""
-            send_as_txt = f" 发言:{t['send_as']}" if t.get("send_as") else " 发言:自账号"
+            if t.get("send_as") == SEND_AS_DISABLE:
+                send_as_txt = " 发言:禁用"
+            elif t.get("send_as"):
+                send_as_txt = f" 发言:{t['send_as']}"
+            else:
+                send_as_txt = " 发言:自账号"
             lines.append(
                 f"#{t['id']} [{'ON' if t.get('enabled', True) else 'OFF'}] "
                 f"[{t['account']}] {t['cron']} -> {t['target']} | {preview}{extra}{delay_txt}{send_as_txt} "
@@ -656,12 +696,18 @@ async def main():
                 else:
                     await e.reply("消息延迟s需为非负整数，或使用 `-` 表示不设置。", parse_mode="md"); return
             send_as_val = None
-            if send_as_txt and send_as_txt != FIELD_PLACEHOLDER:
+            if send_as_txt:
                 txt = send_as_txt.strip()
-                if txt.lstrip("-").isdigit():
+                low = txt.lower()
+                if txt == FIELD_PLACEHOLDER:
+                    send_as_val = None
+                elif low in SEND_AS_DISABLE_KEYWORDS:
+                    send_as_val = SEND_AS_DISABLE
+                elif txt.lstrip("-").isdigit():
                     send_as_val = txt
                 else:
-                    await e.reply("发言ID 需为数字ID（或 `-` 表示自用）。", parse_mode="md"); return
+                    await e.reply("发言ID 需为数字ID、`-`（本账号）或 `none`（禁用）。", parse_mode="md"); return
+            await ensure_send_as_permission(cfg["api_id"], cfg["api_hash"], alias, send_as_val)
             await send_with_user(cfg["api_id"], cfg["api_hash"], alias, target, messages, delay_sec, send_as_val)
             await e.reply(f"✅ 已尝试发送（{alias}）")
         except Exception as ex:
