@@ -68,6 +68,7 @@ INTERVAL_KEYWORD_MAP = {
 }
 INTERVAL_KEYWORD_PATTERN = "|".join(sorted([re.escape(k) for k in INTERVAL_KEYWORD_MAP.keys()], key=len, reverse=True))
 INTERVAL_REGEX = re.compile(rf"^\\s*(\\d+)\\s*({INTERVAL_KEYWORD_PATTERN})\\s*$", re.IGNORECASE)
+DOUBLE_PIPE_PLACEHOLDER = "__DOUBLE_PIPE__"
 
 # ---------------- 基础工具 ----------------
 def load_json(path: Path, default):
@@ -96,8 +97,10 @@ def prompt(label, default=None):
         return prompt(label, default)
     return val
 
-def parse_schedule(expr: str):
-    """支持 6 字段 cron 或 `100s`/`380m`/`36h` 这类间隔表达式。"""
+INTERVAL_UNIT_SECONDS = {"seconds": 1, "minutes": 60, "hours": 3600}
+
+def classify_schedule(expr: str) -> dict:
+    """解析表达式，返回 {'mode': 'interval', 'seconds': ...} 或 {'mode':'cron','expr':...}"""
     expr = (expr or "").strip()
     if not expr:
         raise ValueError("CRON/间隔表达式不能为空")
@@ -106,14 +109,50 @@ def parse_schedule(expr: str):
         value = int(m.group(1))
         unit_key = m.group(2).lower()
         unit = INTERVAL_KEYWORD_MAP[unit_key]
-        if value <= 0:
+        seconds = value * INTERVAL_UNIT_SECONDS[unit]
+        if seconds <= 0:
             raise ValueError("间隔必须大于 0")
-        kwargs = {unit: value}
-        return IntervalTrigger(timezone=SH_TZ, **kwargs)
-    try:
-        return CronTrigger.from_crontab(expr, timezone=SH_TZ, with_seconds=True)
-    except ValueError:
-        return CronTrigger.from_crontab(expr, timezone=SH_TZ)
+        return {"mode": "interval", "seconds": seconds, "expr": expr}
+    compact = expr.replace(" ", "").lower()
+    for key in sorted(INTERVAL_KEYWORD_MAP.keys(), key=len, reverse=True):
+        if compact.endswith(key):
+            num_part = compact[:-len(key)]
+            if num_part.isdigit():
+                unit = INTERVAL_KEYWORD_MAP[key]
+                seconds = int(num_part) * INTERVAL_UNIT_SECONDS[unit]
+                if seconds <= 0:
+                    raise ValueError("间隔必须大于 0")
+                return {"mode": "interval", "seconds": seconds, "expr": expr}
+            continue
+    fields = expr.split()
+    if len(fields) == 6:
+        return {"mode": "cron", "expr": expr, "with_seconds": True, "fields": fields}
+    if len(fields) == 5:
+        return {"mode": "cron", "expr": expr, "with_seconds": False, "fields": fields}
+    raise ValueError("CRON 表达式需 5 或 6 字段，或使用 100s/5m/3h 这种间隔格式。")
+
+def build_trigger(schedule: dict):
+    if schedule["mode"] == "interval":
+        return IntervalTrigger(seconds=schedule["seconds"], timezone=SH_TZ)
+    expr = schedule["expr"]
+    with_seconds = schedule.get("with_seconds", False)
+    if with_seconds:
+        fields = schedule.get("fields") or expr.split()
+        return CronTrigger(
+            second=fields[0],
+            minute=fields[1],
+            hour=fields[2],
+            day=fields[3],
+            month=fields[4],
+            day_of_week=fields[5],
+            timezone=SH_TZ,
+        )
+    return CronTrigger.from_crontab(expr, timezone=SH_TZ)
+
+def split_command_fields(body: str):
+    masked = body.replace("||", DOUBLE_PIPE_PLACEHOLDER)
+    parts = [x.strip().replace(DOUBLE_PIPE_PLACEHOLDER, "||") for x in masked.split("|")]
+    return parts
 
 def fmt_entity(ent):
     name = getattr(ent, "title", None) or \
@@ -161,7 +200,9 @@ async def ensure_send_as_permission(api_id, api_hash, alias: str, send_as_val):
         raise RuntimeError(f"账号 {alias} 未登录，无法校验发言ID。")
     me = await client.get_me()
     if not getattr(me, "premium", False):
-        raise ValueError("该账号未开通 Telegram Premium，不能指定发言ID。")
+        raise ValueError("该账号未开通 Telegram Premium，无法以频道身份发言，请使用 `-` 作为发言ID。")
+    if str(send_as_val).lstrip("-").isdigit() and int(send_as_val) == getattr(me, "id", None):
+        return
     ent = await resolve_entity(client, send_as_val)
     if not getattr(ent, "creator", False):
         raise ValueError("只有频道创建者才能设置此发言ID。")
@@ -239,6 +280,19 @@ def normalize_task_entry(task: dict) -> bool:
     if send_as_missing or task.get("send_as") != send_as_val:
         task["send_as"] = send_as_val
         changed = True
+
+    schedule = task.get("schedule")
+    if not schedule:
+        expr = task.get("cron") or task.get("schedule_expr") or ""
+        schedule = classify_schedule(expr)
+        task["schedule"] = schedule
+        changed = True
+    if schedule.get("mode") == "cron" and not schedule.get("fields"):
+        schedule["fields"] = schedule.get("expr", "").split()
+        changed = True
+    if task.get("cron") != schedule.get("expr"):
+        task["cron"] = schedule.get("expr")
+        changed = True
     return changed
 
 # 运行时客户端池：{alias: TelegramClient}
@@ -290,6 +344,12 @@ async def send_with_user(api_id, api_hash, alias: str, target: str, texts, delay
         for idx, text in enumerate(messages):
             if not text:
                 continue
+            send_kwargs = {}
+            if send_as != SEND_AS_DISABLE:
+                if getattr(ent, "bot", False) or ent.__class__.__name__ == "User":
+                    send_kwargs = {}
+                else:
+                    send_kwargs = {"send_as": await resolve_send_as(client, send_as)}
             await client.send_message(ent, text, **send_kwargs)
             if delay and idx < len(messages) - 1:
                 await asyncio.sleep(delay)
@@ -321,7 +381,7 @@ async def main():
         if not t.get("enabled", True):
             return
         normalize_task_entry(t)
-        trig = parse_schedule(t["cron"])
+        trig = build_trigger(t["schedule"])
         scheduler.add_job(
             send_with_user,
             trigger=trig,
@@ -355,13 +415,13 @@ async def main():
         return (
             "🧭 *签到机器人 · 管理菜单*\n"
             "—— *任务管理* ——\n"
-            "`/addtask` 目标 `|` CRON `|` 文本(多条用`||`) `|` 账号别名 `|` 备注 `|` 消息延迟(`-`=无延迟) `|` 发言ID(`-`=本账号/none=禁用)\n"
+            "`/addtask` 目标 `|` CRON/间隔 `|` 文本(多条用`||`) `|` 账号别名 `|` 备注 `|` 消息延迟(`-`=无延迟) `|` 发言ID(`-`=本账号/none=禁用)\n"
             "`/edittask` ID `|` 目标 `|` CRON/间隔 `|` 文本(多条用`||`) `|` 账号别名 `|` 备注 `|` 消息延迟(`-`=无) `|` 发言ID(`-`=本账号/none=禁用)\n"
             "`/listtasks`  列出任务\n"
             "`/deltask` ID 删除任务\n"
             "`/toggle` ID 启/停任务\n"
             "`/test` 目标 `|` 文本(多条用`||`) `|` 账号别名 `|` 消息延迟(`-`=无延迟) `|` 发言ID(`-`=本账号)  立即测试\n"
-            "_占位符 `-` 表示不设置；发言ID=none 可禁用 send-as；消息延迟=多条消息之间等待时间_\n\n"
+            "占位符 `-` 表示不设置；发言ID=none 可禁用 send-as；消息延迟=多条消息之间等待时间\n\n"
             "—— *账号管理* ——\n"
             "`/adduser` 别名 `|` 手机号(含国家码)\n"
             "`/code`   别名 `|` 验证码\n"
@@ -376,7 +436,7 @@ async def main():
             "`0 0 9 * * *`  每天 09:00（秒 分 时 日 月 周）\n"
             "`30 */10 * * * *`  每 10 分钟执行，并在周期内第 30 秒触发\n"
             "`100s` / `380m` / `36h`  表示纯间隔定时（秒/分钟/小时）\n"
-            "_支持 6 字段（含秒）的 cron 表达式，也兼容 `100s` 这类间隔格式（单位：s/m/h）；目标可用：@用户名 / t.me 链接 / -100群ID / 数字用户ID（需在会话列表） / me_\n"
+            "支持 6 字段（含秒）的 cron 表达式，也兼容 `100s` 这类间隔格式（单位：s/m/h）；目标可用：@用户名 / t.me 链接 / -100群ID / 数字用户ID（需在会话列表） / me\n"
         )
 
     @bot.on(events.NewMessage(pattern=r"^/(start|help)$"))
@@ -484,10 +544,10 @@ async def main():
         if not admin_ok(e): return
         try:
             body = e.pattern_match.group(1).strip()
-            # 目标 | CRON | 文本 | 账号别名 | 备注 | 消息延迟s | 发言ID
-            parts = [x.strip() for x in body.split("|")]
+            # 目标 | CRON/间隔 | 文本 | 账号别名 | 备注 | 消息延迟 | 发言ID
+            parts = split_command_fields(body)
             if len(parts) < 4:
-                await e.reply("格式：`/addtask 目标 | CRON | 文本 | 账号别名 | 备注 | 消息延迟s(-=不设) | 发言ID(-=自账号)`", parse_mode="md"); return
+                await e.reply("格式：`/addtask 目标 | CRON/间隔 | 文本 | 账号别名 | 备注 | 消息延迟(-=不设) | 发言ID(-=自账号)`", parse_mode="md"); return
             target, cron_expr, text_field, alias = parts[0], parts[1], parts[2], parts[3]
             remark = parts[4] if len(parts) >= 5 else ""
             delay_txt = parts[5] if len(parts) >= 6 else ""
@@ -500,7 +560,7 @@ async def main():
                 if delay_txt.isdigit():
                     delay_sec = max(0, int(delay_txt))
                 else:
-                    await e.reply("消息延迟s需为非负整数，或使用 `-` 表示不设置。", parse_mode="md"); return
+                    await e.reply("消息延迟需为非负整数，或使用 `-` 表示不设置。", parse_mode="md"); return
             send_as_val = None
             if send_as_txt:
                 txt = send_as_txt.strip()
@@ -513,8 +573,7 @@ async def main():
                     send_as_val = txt
                 else:
                     await e.reply("发言ID 需为数字ID、`-`（本账号）或 `none`（禁用）。", parse_mode="md"); return
-            # 验证：cron & 账号存在
-            _ = parse_schedule(cron_expr)
+            schedule = classify_schedule(cron_expr)
             if alias not in ensure_accounts()["users"]:
                 await e.reply("账号别名不存在，请先 /listusers 查看或 /adduser 登陆。"); return
             await ensure_send_as_permission(cfg["api_id"], cfg["api_hash"], alias, send_as_val)
@@ -530,6 +589,7 @@ async def main():
                 "delay": delay_sec,
                 "send_as": send_as_val,
                 "enabled": True,
+                "schedule": schedule,
             }
             tasks_state["tasks"].append(task); save_json(TASKS, tasks_state)
             add_job_from_task(task)
@@ -549,10 +609,10 @@ async def main():
         if not admin_ok(e): return
         try:
             body = e.pattern_match.group(1).strip()
-            # ID | 目标 | CRON/间隔 | 文本 | 账号别名 | 备注 | 消息延迟s | 发言ID
-            parts = [x.strip() for x in body.split("|")]
+            # ID | 目标 | CRON/间隔 | 文本 | 账号别名 | 备注 | 消息延迟 | 发言ID
+            parts = split_command_fields(body)
             if len(parts) < 5:
-                await e.reply("格式：`/edittask ID | 目标 | CRON | 文本 | 账号别名 | 备注 | 消息延迟s(-=不设) | 发言ID(-=自账号)`", parse_mode="md"); return
+                await e.reply("格式：`/edittask ID | 目标 | CRON/间隔 | 文本 | 账号别名 | 备注 | 消息延迟(-=不设) | 发言ID(-=自账号)`", parse_mode="md"); return
             tid_txt, target, cron_expr, text_field, alias = parts[0], parts[1], parts[2], parts[3], parts[4]
             remark = parts[5] if len(parts) >= 6 else task.get("remark", "")
             delay_txt = parts[6] if len(parts) >= 7 else ""
@@ -572,7 +632,7 @@ async def main():
                     if delay_txt.isdigit():
                         delay_sec = max(0, int(delay_txt))
                     else:
-                        await e.reply("消息延迟s需为非负整数，或使用 `-` 表示不设置。", parse_mode="md"); return
+                        await e.reply("消息延迟需为非负整数，或使用 `-` 表示不设置。", parse_mode="md"); return
             send_as_val = task.get("send_as")
             if send_as_txt:
                 txt = send_as_txt.strip()
@@ -586,7 +646,7 @@ async def main():
                 else:
                     await e.reply("发言ID 需为数字ID、`-`（本账号）或 `none`（禁用）。", parse_mode="md"); return
             # 验证 cron & 账号
-            _ = parse_schedule(cron_expr)
+            schedule = classify_schedule(cron_expr)
             if alias not in ensure_accounts()["users"]:
                 await e.reply("账号别名不存在，请先 /listusers 查看或 /adduser 登陆。"); return
             await ensure_send_as_permission(cfg["api_id"], cfg["api_hash"], alias, send_as_val)
@@ -598,6 +658,7 @@ async def main():
                 "remark": remark,
                 "delay": delay_sec,
                 "send_as": send_as_val,
+                "schedule": schedule,
             })
             normalize_task_entry(task)
             save_json(TASKS, tasks_state)
@@ -679,10 +740,10 @@ async def main():
         if not admin_ok(e): return
         try:
             body = e.pattern_match.group(1).strip()
-            # 目标 | 文本 | 账号别名 | 消息延迟s | 发言ID
-            parts = [x.strip() for x in body.split("|")]
+            # 目标 | 文本 | 账号别名 | 消息延迟 | 发言ID
+            parts = split_command_fields(body)
             if len(parts) < 3:
-                await e.reply("格式：`/test 目标 | 文本 | 账号别名 | 消息延迟s(-=不设) | 发言ID(-=自账号)`", parse_mode="md"); return
+                await e.reply("格式：`/test 目标 | 文本 | 账号别名 | 消息延迟(-=不设) | 发言ID(-=自账号)`", parse_mode="md"); return
             target, text_field, alias = parts[0], parts[1], parts[2]
             delay_txt = parts[3] if len(parts) >= 4 else ""
             send_as_txt = parts[4] if len(parts) >= 5 else ""
@@ -694,7 +755,7 @@ async def main():
                 if delay_txt.isdigit():
                     delay_sec = max(0, int(delay_txt))
                 else:
-                    await e.reply("消息延迟s需为非负整数，或使用 `-` 表示不设置。", parse_mode="md"); return
+                    await e.reply("消息延迟需为非负整数，或使用 `-` 表示不设置。", parse_mode="md"); return
             send_as_val = None
             if send_as_txt:
                 txt = send_as_txt.strip()
