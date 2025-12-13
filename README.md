@@ -93,7 +93,7 @@ bash manage.sh update    # 从仓库更新到 /opt 并重启
 
 ## 🐳 Docker 部署
 
-也可以通过 Docker 运行（初次会根据环境变量生成 `config.json`）。提供脚本 `./docker-install.sh`，会交互式询问 `API_ID`/`API_HASH`/`BOT_TOKEN`/`ADMIN_IDS` 及数据目录，然后执行 `docker build` + `docker run`。
+也可以通过 Docker 运行（初次会根据环境变量生成 `config.json`）。提供脚本 `./docker-install.sh`，会交互式询问 `API_ID`/`API_HASH`/`BOT_TOKEN`/`ADMIN_IDS`、容器名称与数据目录，然后执行 `docker build` + `docker run`。你可以多次运行该脚本，为不同容器指定不同名称及数据目录，从而实现多实例。
 
 也可手动执行（等同于脚本步骤）：
 
@@ -112,6 +112,8 @@ docker run -d --name tg-checkin \
 - `BOT_TOKEN`：@BotFather 下发  
 - `ADMIN_IDS`：逗号分隔的 Telegram 用户 ID  
 - `/data` 用于持久化 `config.json`、`accounts.json`、`tasks.json`、`*.session`，请绑定到宿主目录
+
+如需多实例部署，请为每个容器指定不同的 `--name` 与宿主数据目录（例如 `-v $(pwd)/data-a:/data`、`-v $(pwd)/data-b:/data`）。
 
 容器日志可通过 `docker logs -f tg-checkin` 查看，其余命令与裸机部署相同。
 

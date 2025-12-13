@@ -2,8 +2,8 @@
 set -euo pipefail
 
 IMAGE_NAME="tg-checkin-bot"
-CONTAINER_NAME="tg-checkin"
-DATA_DIR_DEFAULT="$PWD/data"
+DEFAULT_CONTAINER="tg-checkin"
+DATA_DIR_BASE="$PWD"
 
 echo "=== TG Checkin Docker 安装器 ==="
 
@@ -11,8 +11,10 @@ read -rp "API_ID (my.telegram.org): " API_ID
 read -rp "API_HASH: " API_HASH
 read -rp "BOT_TOKEN (来自 BotFather): " BOT_TOKEN
 read -rp "管理员 ID（逗号分隔，数字）: " ADMIN_IDS
-read -rp "数据目录 [$DATA_DIR_DEFAULT]: " DATA_DIR
-DATA_DIR="${DATA_DIR:-$DATA_DIR_DEFAULT}"
+read -rp "容器名称 [${DEFAULT_CONTAINER}]: " CONTAINER_NAME
+CONTAINER_NAME="${CONTAINER_NAME:-$DEFAULT_CONTAINER}"
+read -rp "数据目录 [${DATA_DIR_BASE}/${CONTAINER_NAME}-data]: " DATA_DIR
+DATA_DIR="${DATA_DIR:-${DATA_DIR_BASE}/${CONTAINER_NAME}-data}"
 
 mkdir -p "$DATA_DIR"
 
@@ -34,5 +36,6 @@ docker run -d \
 
 echo
 echo "✅ Docker 安装完成！"
+echo "容器：${CONTAINER_NAME}"
 echo "日志：docker logs -f ${CONTAINER_NAME}"
 echo "数据目录：${DATA_DIR}"
