@@ -417,11 +417,18 @@ async def main():
     log_channel = cfg.get("log_channel")
     log_enabled = bool(log_channel) and cfg.get("log_enabled", True)
 
+    def parse_log_target(target):
+        if target and isinstance(target, str) and target.strip().lstrip("-").isdigit():
+            return int(target.strip())
+        return target
+
+    log_channel_target = parse_log_target(log_channel)
+
     async def send_log_message(text: str):
         if not log_enabled or not text:
             return
         try:
-            await bot.send_message(log_channel, text)
+            await bot.send_message(log_channel_target, text)
         except Exception as ex:
             print(f"[log] 发送失败：{ex}")
 
@@ -431,7 +438,8 @@ async def main():
             await send_log_message(f"⚠️ 任务 #{task_id} 不存在，已跳过。")
             return
         normalize_task_entry(t)
-        info = f"任务#{task_id} [{t['account']}] -> {t['target']}"
+        remark = t.get("remark") or "无备注"
+        info = f"任务#{task_id} [{t['account']}] -> {t['target']}（备注：{remark}）"
         try:
             await send_with_user(cfg["api_id"], cfg["api_hash"], t["account"], t["target"],
                                  t["messages"], t.get("delay", 0), t.get("send_as"))
@@ -875,9 +883,20 @@ async def main():
         try:
             body = e.pattern_match.group(1).strip()
             parts = [x.strip() for x in body.split("|")]
-            if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
-                await e.reply("格式：`/delaynext ID | 秒数`"); return
-            tid = int(parts[0]); secs = int(parts[1])
+            if len(parts) != 2 or not parts[0].isdigit():
+                await e.reply("格式：`/delaynext ID | 秒数/间隔(如 30s 5m)`"); return
+            tid = int(parts[0])
+            delta_expr = parts[1]
+            try:
+                delta_schedule = classify_schedule(delta_expr)
+                if delta_schedule.get("mode") != "interval":
+                    raise ValueError
+                secs = delta_schedule["seconds"]
+            except Exception:
+                if delta_expr.isdigit():
+                    secs = int(delta_expr)
+                else:
+                    await e.reply("请输入合法的秒数或间隔，如 60 / 30s / 5m。"); return
             if secs < 0:
                 await e.reply("秒数需为非负整数。"); return
             task = next((x for x in tasks_state["tasks"] if x["id"] == tid), None)
