@@ -79,6 +79,8 @@ bash manage.sh update    # 从仓库更新到 /opt 并重启
 /deltask ID
 /toggle ID
 /test 目标 | 文本 | 账号别名 | 消息延迟s(-=无) | 发言ID(-=本账号/none=禁用)
+/nextinterval ID 或 all          # 查看间隔任务剩余时间
+/delaynext ID | 秒数              # 临时调整间隔任务的下一次执行时间
 ```
 > CRON 支持 6 字段（秒 分 时 日 月 周），也可直接写 `100s` / `380m` / `36h` 表示每隔一定秒/分/小时执行一次。
 
@@ -112,6 +114,7 @@ docker run -d --name tg-checkin \
 - `BOT_TOKEN`：@BotFather 下发  
 - `ADMIN_IDS`：逗号分隔的 Telegram 用户 ID  
 - `/data` 用于持久化 `config.json`、`accounts.json`、`tasks.json`、`*.session`，请绑定到宿主目录
+- 可选：在 `config.json` 中设置 `"log_channel": "-100xxxx"`（以及 `"log_enabled": true`）即可让 Bot 将启动/任务执行日志同步到指定频道或群组
 
 如需多实例部署，请为每个容器指定不同的 `--name` 与宿主数据目录（例如 `-v $(pwd)/data-a:/data`、`-v $(pwd)/data-b:/data`）。
 

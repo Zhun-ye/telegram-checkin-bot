@@ -18,7 +18,7 @@ import os
 import re
 import sys
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 # 终端编码保护
@@ -53,8 +53,11 @@ from zoneinfo import ZoneInfo  # Python3.9+
 CONFIG = Path("config.json")
 ACCOUNTS = Path("accounts.json")
 TASKS = Path("tasks.json")
-BOT_SESSION = "bot"  # 机器人会话
+TOKEN_DIR = Path("token")
+TOKEN_DIR.mkdir(exist_ok=True)
+BOT_SESSION = str(TOKEN_DIR / "bot")  # 机器人会话
 SH_TZ = ZoneInfo("Asia/Shanghai")
+BOT_TOKEN_FILE = TOKEN_DIR / "bot_token"
 FIELD_PLACEHOLDER = "-"  # 命令中未设置字段的占位符
 SEND_AS_DISABLE = "__NO_SEND_AS__"
 SEND_AS_DISABLE_KEYWORDS = {"none", "no", "off", "0", "disable", "禁用"}
@@ -69,6 +72,18 @@ INTERVAL_KEYWORD_MAP = {
 INTERVAL_KEYWORD_PATTERN = "|".join(sorted([re.escape(k) for k in INTERVAL_KEYWORD_MAP.keys()], key=len, reverse=True))
 INTERVAL_REGEX = re.compile(rf"^\\s*(\\d+)\\s*({INTERVAL_KEYWORD_PATTERN})\\s*$", re.IGNORECASE)
 DOUBLE_PIPE_PLACEHOLDER = "__DOUBLE_PIPE__"
+
+def format_seconds(sec: int) -> str:
+    sec = max(0, int(sec))
+    h, r = divmod(sec, 3600)
+    m, s = divmod(r, 60)
+    parts = []
+    if h:
+        parts.append(f"{h}h")
+    if m:
+        parts.append(f"{m}m")
+    parts.append(f"{s}s")
+    return "".join(parts)
 
 # ---------------- 基础工具 ----------------
 def load_json(path: Path, default):
@@ -214,8 +229,16 @@ def ensure_config():
         cfg["api_id"] = int(prompt("请输入 api_id（my.telegram.org 申请）"))
     if not cfg.get("api_hash"):
         cfg["api_hash"] = prompt("请输入 api_hash")
-    if not cfg.get("bot_token"):
-        cfg["bot_token"] = prompt("请输入 管理Bot 的 bot_token")
+    token_text = None
+    if BOT_TOKEN_FILE.exists():
+        token_text = BOT_TOKEN_FILE.read_text(encoding="utf-8").strip()
+    elif cfg.get("bot_token"):
+        token_text = cfg["bot_token"].strip()
+        BOT_TOKEN_FILE.write_text(token_text, encoding="utf-8")
+    else:
+        token_text = prompt("请输入 管理Bot 的 bot_token")
+        BOT_TOKEN_FILE.write_text(token_text, encoding="utf-8")
+    cfg["bot_token"] = token_text
     if not cfg.get("admin_ids"):
         admin = prompt("请输入管理员用户ID（数字，可多个，逗号分隔）")
         ids = []
@@ -229,7 +252,14 @@ def ensure_config():
 
 def ensure_accounts():
     data = load_json(ACCOUNTS, {"users": {}})  # { alias: {phone, session_file} }
-    save_json(ACCOUNTS, data)
+    changed = False
+    for alias, info in data.get("users", {}).items():
+        path = session_file_for(alias)
+        if info.get("session_file") != path:
+            info["session_file"] = path
+            changed = True
+    if changed:
+        save_json(ACCOUNTS, data)
     return data
 
 def ensure_tasks():
@@ -302,7 +332,16 @@ ACCOUNT_LOCKS: dict[str, asyncio.Lock] = {}
 
 # ---------------- 账号管理 ----------------
 def session_file_for(alias: str) -> str:
-    return f"user-{alias}.session"
+    TOKEN_DIR.mkdir(exist_ok=True)
+    new_path = TOKEN_DIR / f"user-{alias}.session"
+    old_path = Path(f"user-{alias}.session")
+    if old_path.exists() and not new_path.exists():
+        try:
+            old_path.replace(new_path)
+        except Exception:
+            new_path.write_bytes(old_path.read_bytes())
+            old_path.unlink(missing_ok=True)
+    return str(new_path)
 
 async def get_or_start_client(api_id, api_hash, alias: str) -> TelegramClient:
     if alias in CLIENTS:
@@ -336,21 +375,14 @@ async def send_with_user(api_id, api_hash, alias: str, target: str, texts, delay
         else:
             messages = [str(x) for x in texts]
         delay = max(0, int(delay or 0))
-        send_kwargs = {}
-        if send_as == SEND_AS_DISABLE:
-            send_kwargs = {}
-        else:
-            send_kwargs = {"send_as": await resolve_send_as(client, send_as)}
+        send_as_peer = None
+        if send_as != SEND_AS_DISABLE and not getattr(ent, "bot", False) and ent.__class__.__name__ != "User":
+            send_as_peer = await resolve_send_as(client, send_as)
         for idx, text in enumerate(messages):
             if not text:
                 continue
-            send_kwargs = {}
-            if send_as != SEND_AS_DISABLE:
-                if getattr(ent, "bot", False) or ent.__class__.__name__ == "User":
-                    send_kwargs = {}
-                else:
-                    send_kwargs = {"send_as": await resolve_send_as(client, send_as)}
-            await client.send_message(ent, text, **send_kwargs)
+            kwargs = {"send_as": send_as_peer} if send_as_peer else {}
+            await client.send_message(ent, text, **kwargs)
             if delay and idx < len(messages) - 1:
                 await asyncio.sleep(delay)
         if delay and messages:
@@ -368,9 +400,45 @@ async def main():
     if upgraded:
         save_json(TASKS, tasks_state)
 
+    # 迁移旧 bot.session
+    old_bot_session = Path("bot.session")
+    new_bot_session = TOKEN_DIR / "bot.session"
+    if old_bot_session.exists() and not new_bot_session.exists():
+        try:
+            old_bot_session.replace(new_bot_session)
+        except Exception:
+            new_bot_session.write_bytes(old_bot_session.read_bytes())
+            old_bot_session.unlink(missing_ok=True)
+
     # 机器人
     bot = TelegramClient(BOT_SESSION, cfg["api_id"], cfg["api_hash"])
     await bot.start(bot_token=cfg["bot_token"])
+
+    log_channel = cfg.get("log_channel")
+    log_enabled = bool(log_channel) and cfg.get("log_enabled", True)
+
+    async def send_log_message(text: str):
+        if not log_enabled or not text:
+            return
+        try:
+            await bot.send_message(log_channel, text)
+        except Exception as ex:
+            print(f"[log] 发送失败：{ex}")
+
+    async def execute_task(task_id: int):
+        t = next((x for x in tasks_state["tasks"] if x["id"] == task_id), None)
+        if not t:
+            await send_log_message(f"⚠️ 任务 #{task_id} 不存在，已跳过。")
+            return
+        normalize_task_entry(t)
+        info = f"任务#{task_id} [{t['account']}] -> {t['target']}"
+        try:
+            await send_with_user(cfg["api_id"], cfg["api_hash"], t["account"], t["target"],
+                                 t["messages"], t.get("delay", 0), t.get("send_as"))
+            await send_log_message(f"✅ {info} 已执行。")
+        except Exception as exc:
+            await send_log_message(f"❌ {info} 发送失败：{exc}")
+            raise
 
     # 调度器（上海时区）
     scheduler = AsyncIOScheduler(timezone=SH_TZ)
@@ -383,17 +451,9 @@ async def main():
         normalize_task_entry(t)
         trig = build_trigger(t["schedule"])
         scheduler.add_job(
-            send_with_user,
+            execute_task,
             trigger=trig,
-            args=[
-                cfg["api_id"],
-                cfg["api_hash"],
-                t["account"],
-                t["target"],
-                t["messages"],
-                t.get("delay", 0),
-                t.get("send_as"),
-            ],
+            args=[t["id"]],
             id=str(t["id"]),
             replace_existing=True,
             coalesce=True,
@@ -405,6 +465,18 @@ async def main():
             add_job_from_task(t)
         except Exception as e:
             print(f"任务 {t.get('id')} 恢复失败：{e}")
+
+    def is_interval_task(task):
+        normalize_task_entry(task)
+        return task.get("schedule", {}).get("mode") == "interval"
+
+    def describe_next_run(task):
+        job = scheduler.get_job(str(task["id"]))
+        if not job or not job.next_run_time:
+            return "未找到调度"
+        next_run = job.next_run_time.astimezone(SH_TZ)
+        remain = (next_run - datetime.now(SH_TZ)).total_seconds()
+        return f"{next_run.strftime('%Y-%m-%d %H:%M:%S')}，剩余 {format_seconds(remain)}"
 
     # 权限
     ADMINS = set(cfg["admin_ids"])
@@ -421,6 +493,8 @@ async def main():
             "`/deltask` ID 删除任务\n"
             "`/toggle` ID 启/停任务\n"
             "`/test` 目标 `|` 文本(多条用`||`) `|` 账号别名 `|` 消息延迟(`-`=无延迟) `|` 发言ID(`-`=本账号)  立即测试\n"
+            "`/nextinterval ID` 查看某个间隔任务剩余时间；`/nextinterval all` 查看全部间隔任务\n"
+            "`/delaynext ID | 秒数` 临时调整间隔任务的下一次执行时间\n"
             "占位符 `-` 表示不设置；发言ID=none 可禁用 send-as；消息延迟=多条消息之间等待时间\n\n"
             "—— *账号管理* ——\n"
             "`/adduser` 别名 `|` 手机号(含国家码)\n"
@@ -774,6 +848,50 @@ async def main():
         except Exception as ex:
             await e.reply(f"❌ 发送失败：{ex}")
 
+    @bot.on(events.NewMessage(pattern=r"^/nextinterval(?:\s+(.*))?$"))
+    async def _(e):
+        if not admin_ok(e): return
+        arg = (e.pattern_match.group(1) or "").strip()
+        interval_tasks = [t for t in tasks_state["tasks"] if is_interval_task(t)]
+        if not interval_tasks:
+            await e.reply("暂无间隔任务。"); return
+        if not arg or arg.lower() == "all":
+            lines = []
+            for t in interval_tasks:
+                info = describe_next_run(t)
+                lines.append(f"#{t['id']} [{t['account']}] -> {t['target']}  {info}")
+            await e.reply("⏱ 间隔任务计划：\n" + "\n".join(lines)); return
+        if not arg.isdigit():
+            await e.reply("参数需为任务ID或 all。"); return
+        tid = int(arg)
+        task = next((x for x in interval_tasks if x["id"] == tid), None)
+        if not task:
+            await e.reply("未找到该间隔任务ID。"); return
+        await e.reply(f"#{tid} 下一次执行：{describe_next_run(task)}")
+
+    @bot.on(events.NewMessage(pattern=r"^/delaynext\s+(.+)"))
+    async def _(e):
+        if not admin_ok(e): return
+        try:
+            body = e.pattern_match.group(1).strip()
+            parts = [x.strip() for x in body.split("|")]
+            if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
+                await e.reply("格式：`/delaynext ID | 秒数`"); return
+            tid = int(parts[0]); secs = int(parts[1])
+            if secs < 0:
+                await e.reply("秒数需为非负整数。"); return
+            task = next((x for x in tasks_state["tasks"] if x["id"] == tid), None)
+            if not task or not is_interval_task(task):
+                await e.reply("该任务不存在或不是间隔任务。"); return
+            job = scheduler.get_job(str(tid))
+            if not job:
+                await e.reply("未找到该任务的调度。"); return
+            new_time = datetime.now(SH_TZ) + timedelta(seconds=secs)
+            job.modify(next_run_time=new_time)
+            await e.reply(f"✅ 已将任务 #{tid} 的下一次执行时间调整为 {new_time.strftime('%Y-%m-%d %H:%M:%S')}，约 {format_seconds(secs)} 后执行。")
+        except Exception as ex:
+            await e.reply(f"❌ 调整失败：{ex}")
+
     # ---------- 状态/查询 ----------
     @bot.on(events.NewMessage(pattern=r"^/status$"))
     async def _(e):
@@ -823,6 +941,7 @@ async def main():
             await e.reply(f"❌ 解析失败：{ex}")
 
     print("✅ 管理Bot已启动（上海时区）。用管理员账号给Bot发 /help 查看菜单。")
+    await send_log_message("✅ 管理Bot已启动。")
 
     await bot.run_until_disconnected()
 
