@@ -8,6 +8,7 @@
 - 🤖 **Bot 管理**：所有任务和账号管理都通过一个 Bot 完成
 - 👥 **多账号支持**：可同时登录多个 Telegram 个人号
 - ⏰ **灵活定时**：支持 6 字段 Cron（含秒）或 `100s/36h` 间隔表达式（上海时区）
+- 🧩 **任务模板**：可定义模板并批量创建引用模板的定时任务，一改模板即可同步所有任务
 - 📝 **任务备注**：每个任务可带备注，方便区分
 - 📊 **状态监控**：随时查看账号实时状态（在线/离线/最近上线）
 - 🔐 **独立运行环境**：自动创建虚拟环境，依赖与系统隔离
@@ -81,8 +82,12 @@ bash manage.sh update    # 从仓库更新到 /opt 并重启
 /test 目标 | 文本 | 账号别名 | 消息延迟s(-=无) | 发言ID(-=本账号/none=禁用)
 /nextinterval ID 或 all          # 查看间隔任务剩余时间
 /delaynext ID | 秒数              # 临时调整间隔任务的下一次执行时间
+/listtpl                              # 查看模板
+/addtpl 名称 | 目标 | 文本(多条用||)
+/edittpl ID | 名称 | 目标 | 文本(多条用||)
+/addtpltask 模板ID | CRON/间隔 | 账号别名 | 备注 | 消息延迟s(-=无) | 发言ID(-=本账号/none=禁用)
 ```
-> CRON 支持 6 字段（秒 分 时 日 月 周），也可直接写 `100s` / `380m` / `36h` 表示每隔一定秒/分/小时执行一次。
+> CRON 支持 6 字段（秒 分 时 日 月 周），也可直接写 `100s` / `380m` / `36h` 表示每隔一定秒/分/小时执行一次。模板任务 ID 以 `T` 开头（例如 `T1`），在 `/edittask`、`/deltask`、`/toggle`、`/nextinterval`、`/delaynext` 中都可以直接使用。
 
 ### 状态与查询
 ```
@@ -129,9 +134,10 @@ docker run -d --name tg-checkin \
 - `main.py`：主程序  
 - `config.json`：全局配置  
 - `accounts.json`：账号清单（别名 → session 文件）  
-- `tasks.json`：任务配置  
-- `user-<alias>.session`：个人账号会话  
-- `bot.session`：Bot 会话  
+- `tasks.json`：常规任务配置  
+- `templates.json`：任务模板定义  
+- `template_tasks.json`：基于模板创建的任务  
+- `token/`：统一存放 `bot.session`、`bot_token`、`user-<alias>.session` 等敏感文件，方便迁移与隔离  
 
 ---
 

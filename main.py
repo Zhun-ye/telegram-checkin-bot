@@ -53,6 +53,8 @@ from zoneinfo import ZoneInfo  # Python3.9+
 CONFIG = Path("config.json")
 ACCOUNTS = Path("accounts.json")
 TASKS = Path("tasks.json")
+TEMPLATES = Path("templates.json")
+TEMPLATE_TASKS = Path("template_tasks.json")
 TOKEN_DIR = Path("token")
 TOKEN_DIR.mkdir(exist_ok=True)
 BOT_SESSION = str(TOKEN_DIR / "bot")  # 机器人会话
@@ -267,6 +269,16 @@ def ensure_tasks():
     save_json(TASKS, data)
     return data
 
+def ensure_templates():
+    data = load_json(TEMPLATES, {"templates": [], "seq": 1})
+    save_json(TEMPLATES, data)
+    return data
+
+def ensure_template_tasks():
+    data = load_json(TEMPLATE_TASKS, {"tasks": [], "seq": 1})
+    save_json(TEMPLATE_TASKS, data)
+    return data
+
 def normalize_task_entry(task: dict) -> bool:
     changed = False
     msgs_missing = "messages" not in task
@@ -319,6 +331,19 @@ def normalize_task_entry(task: dict) -> bool:
         changed = True
     if schedule.get("mode") == "cron" and not schedule.get("fields"):
         schedule["fields"] = schedule.get("expr", "").split()
+        changed = True
+    if task.get("cron") != schedule.get("expr"):
+        task["cron"] = schedule.get("expr")
+        changed = True
+    return changed
+
+def normalize_template_task_entry(task: dict) -> bool:
+    changed = False
+    schedule = task.get("schedule")
+    if not schedule:
+        expr = task.get("cron") or task.get("schedule_expr") or ""
+        schedule = classify_schedule(expr)
+        task["schedule"] = schedule
         changed = True
     if task.get("cron") != schedule.get("expr"):
         task["cron"] = schedule.get("expr")
@@ -393,12 +418,30 @@ async def main():
     cfg = ensure_config()
     acc = ensure_accounts()
     tasks_state = ensure_tasks()
+    templates_state = ensure_templates()
+    template_tasks_state = ensure_template_tasks()
     upgraded = False
     for t in tasks_state["tasks"]:
         if normalize_task_entry(t):
             upgraded = True
     if upgraded:
         save_json(TASKS, tasks_state)
+
+    tpl_upgraded = False
+    for tt in template_tasks_state["tasks"]:
+        if normalize_template_task_entry(tt):
+            tpl_upgraded = True
+    if tpl_upgraded:
+        save_json(TEMPLATE_TASKS, template_tasks_state)
+
+    def find_template(tid: int):
+        return next((tpl for tpl in templates_state["templates"] if tpl["id"] == tid), None)
+
+    def save_templates():
+        save_json(TEMPLATES, templates_state)
+
+    def save_template_tasks():
+        save_json(TEMPLATE_TASKS, template_tasks_state)
 
     # 迁移旧 bot.session
     old_bot_session = Path("bot.session")
@@ -448,6 +491,25 @@ async def main():
             await send_log_message(f"❌ {info} 发送失败：{exc}")
             raise
 
+    async def execute_template_task(task_id: int):
+        tt = next((x for x in template_tasks_state["tasks"] if x["id"] == task_id), None)
+        if not tt:
+            await send_log_message(f"⚠️ 模板任务 T{task_id} 不存在，已跳过。")
+            return
+        tpl = find_template(tt["template_id"])
+        if not tpl:
+            await send_log_message(f"⚠️ 模板任务 T{task_id} 找不到模板 #{tt['template_id']}。")
+            return
+        normalize_template_task_entry(tt)
+        info = f"模板任务T{task_id} [{tt['account']}] 模板:{tpl.get('name', tt['template_id'])} -> {tpl['target']}（备注：{tt.get('remark') or '无备注'}）"
+        try:
+            await send_with_user(cfg["api_id"], cfg["api_hash"], tt["account"], tpl["target"],
+                                 tpl["messages"], tt.get("delay", 0), tt.get("send_as"))
+            await send_log_message(f"✅ {info} 已执行。")
+        except Exception as exc:
+            await send_log_message(f"❌ {info} 发送失败：{exc}")
+            raise
+
     # 调度器（上海时区）
     scheduler = AsyncIOScheduler(timezone=SH_TZ)
     scheduler.start()
@@ -468,11 +530,34 @@ async def main():
             misfire_grace_time=120,
         )
 
+    def template_job_id(tid):
+        return f"tpl-{tid}"
+
+    def add_job_from_template_task(tt):
+        if not tt.get("enabled", True):
+            return
+        normalize_template_task_entry(tt)
+        trig = build_trigger(tt["schedule"])
+        scheduler.add_job(
+            execute_template_task,
+            trigger=trig,
+            args=[tt["id"]],
+            id=template_job_id(tt["id"]),
+            replace_existing=True,
+            coalesce=True,
+            misfire_grace_time=120,
+        )
+
     for t in tasks_state["tasks"]:
         try:
             add_job_from_task(t)
         except Exception as e:
             print(f"任务 {t.get('id')} 恢复失败：{e}")
+    for tt in template_tasks_state["tasks"]:
+        try:
+            add_job_from_template_task(tt)
+        except Exception as e:
+            print(f"模板任务 T{tt.get('id')} 恢复失败：{e}")
 
     def is_interval_task(task):
         normalize_task_entry(task)
@@ -485,6 +570,58 @@ async def main():
         next_run = job.next_run_time.astimezone(SH_TZ)
         remain = (next_run - datetime.now(SH_TZ)).total_seconds()
         return f"{next_run.strftime('%Y-%m-%d %H:%M:%S')}，剩余 {format_seconds(remain)}"
+
+    def get_all_interval_tasks():
+        tasks = []
+        for t in tasks_state["tasks"]:
+            if is_interval_task(t):
+                tasks.append(("normal", t))
+        for tt in template_tasks_state["tasks"]:
+            if normalize_template_task_entry(tt) or True:
+                if tt.get("schedule", {}).get("mode") == "interval":
+                    tasks.append(("template", tt))
+        return tasks
+
+    def describe_template_next_run(tt):
+        job = scheduler.get_job(template_job_id(tt["id"]))
+        if not job or not job.next_run_time:
+            return "未找到调度"
+        next_run = job.next_run_time.astimezone(SH_TZ)
+        remain = (next_run - datetime.now(SH_TZ)).total_seconds()
+        tpl = find_template(tt["template_id"])
+        name = tpl.get("name", f"模板{tt['template_id']}") if tpl else f"模板{tt['template_id']}"
+        return f"{next_run.strftime('%Y-%m-%d %H:%M:%S')}，剩余 {format_seconds(remain)}，模板:{name}"
+
+    def parse_task_id(token: str):
+        token = token.strip()
+        if not token:
+            return None
+        if token.lower().startswith("t"):
+            num = token[1:]
+            if num.isdigit():
+                return ("template", int(num))
+        if token.isdigit():
+            return ("normal", int(token))
+        return None
+
+    def find_task_by_kind(kind: str, task_id: int):
+        if kind == "normal":
+            return next((x for x in tasks_state["tasks"] if x["id"] == task_id), None)
+        return next((x for x in template_tasks_state["tasks"] if x["id"] == task_id), None)
+
+    def send_as_text(val):
+        if val == SEND_AS_DISABLE:
+            return "发言:禁用"
+        if val:
+            return f"发言:{val}"
+        return "发言:自账号"
+
+    def template_brief(tt):
+        tpl = find_template(tt["template_id"])
+        if tpl:
+            preview = tpl["messages"][0][:40] + ("..." if len(tpl["messages"][0]) > 40 else "")
+            return tpl.get("name", f"模板{tpl['id']}"), tpl["target"], preview
+        return f"模板{tt['template_id']}", "(模板缺失)", "(无文本)"
 
     # 权限
     ADMINS = set(cfg["admin_ids"])
@@ -502,8 +639,14 @@ async def main():
             "`/toggle` ID 启/停任务\n"
             "`/test` 目标 `|` 文本(多条用`||`) `|` 账号别名 `|` 消息延迟(`-`=无延迟) `|` 发言ID(`-`=本账号)  立即测试\n"
             "`/nextinterval ID` 查看某个间隔任务剩余时间；`/nextinterval all` 查看全部间隔任务\n"
-            "`/delaynext ID | 秒数` 临时调整间隔任务的下一次执行时间\n"
+            "`/delaynext ID | 秒数/间隔` 临时调整间隔任务的下一次执行时间\n"
             "占位符 `-` 表示不设置；发言ID=none 可禁用 send-as；消息延迟=多条消息之间等待时间\n\n"
+            "—— *任务模板* ——\n"
+            "`/listtpl` 查看模板列表\n"
+            "`/addtpl` 名称 `|` 目标 `|` 文本(多条用`||`)\n"
+            "`/edittpl` ID `|` 名称 `|` 目标 `|` 文本(多条用`||`)\n"
+            "`/addtpltask` 模板ID `|` CRON/间隔 `|` 账号 `|` 备注 `|` 消息延迟(`-`=无) `|` 发言ID(`-`/none)\n"
+            "_模板任务 ID 以 `T` 开头，例如 `T1`；`/edittask T1 | 模板ID | CRON/间隔 | 账号 | 备注 | 消息延迟 | 发言ID` 可修改_\n\n"
             "—— *账号管理* ——\n"
             "`/adduser` 别名 `|` 手机号(含国家码)\n"
             "`/code`   别名 `|` 验证码\n"
@@ -691,80 +834,144 @@ async def main():
         if not admin_ok(e): return
         try:
             body = e.pattern_match.group(1).strip()
-            # ID | 目标 | CRON/间隔 | 文本 | 账号别名 | 备注 | 消息延迟 | 发言ID
             parts = split_command_fields(body)
-            if len(parts) < 5:
-                await e.reply("格式：`/edittask ID | 目标 | CRON/间隔 | 文本 | 账号别名 | 备注 | 消息延迟(-=不设) | 发言ID(-=自账号)`", parse_mode="md"); return
-            tid_txt, target, cron_expr, text_field, alias = parts[0], parts[1], parts[2], parts[3], parts[4]
-            remark = parts[5] if len(parts) >= 6 else task.get("remark", "")
-            delay_txt = parts[6] if len(parts) >= 7 else ""
-            send_as_txt = parts[7] if len(parts) >= 8 else ""
-            if not tid_txt.isdigit():
-                await e.reply("ID 必须是数字。"); return
-            tid = int(tid_txt)
-            task = next((x for x in tasks_state["tasks"] if x["id"] == tid), None)
+            if not parts:
+                await e.reply("格式：`/edittask ID | ...`，普通任务需提供目标、文本等，模板任务需 `T` 开头。", parse_mode="md"); return
+            parsed = parse_task_id(parts[0])
+            if not parsed:
+                await e.reply("请提供正确的任务 ID，模板任务使用 `T1` 这种格式。"); return
+            kind, tid = parsed
+            task = find_task_by_kind(kind, tid)
             if not task:
                 await e.reply("未找到该任务 ID。"); return
-            messages = [m.strip() for m in text_field.split("||") if m.strip()]
-            if not messages:
-                await e.reply("消息内容不能为空，可用 `||` 分隔多条。", parse_mode="md"); return
-            delay_sec = task.get("delay", 0)
-            if delay_txt:
-                if delay_txt != FIELD_PLACEHOLDER:
-                    if delay_txt.isdigit():
-                        delay_sec = max(0, int(delay_txt))
+            if kind == "normal":
+                if len(parts) < 5:
+                    await e.reply("格式：`/edittask ID | 目标 | CRON/间隔 | 文本 | 账号别名 | 备注 | 消息延迟(-=不设) | 发言ID(-=自账号)`", parse_mode="md"); return
+                target, cron_expr, text_field, alias = parts[1], parts[2], parts[3], parts[4]
+                remark = parts[5] if len(parts) >= 6 else task.get("remark", "")
+                delay_txt = parts[6] if len(parts) >= 7 else ""
+                send_as_txt = parts[7] if len(parts) >= 8 else ""
+                messages = [m.strip() for m in text_field.split("||") if m.strip()]
+                if not messages:
+                    await e.reply("消息内容不能为空，可用 `||` 分隔多条。", parse_mode="md"); return
+                delay_sec = task.get("delay", 0)
+                if delay_txt:
+                    if delay_txt != FIELD_PLACEHOLDER:
+                        if delay_txt.isdigit():
+                            delay_sec = max(0, int(delay_txt))
+                        else:
+                            await e.reply("消息延迟需为非负整数，或使用 `-` 表示不设置。", parse_mode="md"); return
+                send_as_val = task.get("send_as")
+                if send_as_txt:
+                    txt = send_as_txt.strip()
+                    low = txt.lower()
+                    if txt == FIELD_PLACEHOLDER:
+                        send_as_val = None
+                    elif low in SEND_AS_DISABLE_KEYWORDS:
+                        send_as_val = SEND_AS_DISABLE
+                    elif txt.lstrip("-").isdigit():
+                        send_as_val = txt
                     else:
-                        await e.reply("消息延迟需为非负整数，或使用 `-` 表示不设置。", parse_mode="md"); return
-            send_as_val = task.get("send_as")
-            if send_as_txt:
-                txt = send_as_txt.strip()
-                low = txt.lower()
-                if txt == FIELD_PLACEHOLDER:
-                    send_as_val = None
-                elif low in SEND_AS_DISABLE_KEYWORDS:
-                    send_as_val = SEND_AS_DISABLE
-                elif txt.lstrip("-").isdigit():
-                    send_as_val = txt
+                        await e.reply("发言ID 需为数字ID、`-`（本账号）或 `none`（禁用）。", parse_mode="md"); return
+                schedule = classify_schedule(cron_expr)
+                if alias not in ensure_accounts()["users"]:
+                    await e.reply("账号别名不存在，请先 /listusers 查看或 /adduser 登陆。"); return
+                await ensure_send_as_permission(cfg["api_id"], cfg["api_hash"], alias, send_as_val)
+                task.update({
+                    "target": target,
+                    "cron": cron_expr,
+                    "messages": messages,
+                    "account": alias,
+                    "remark": remark,
+                    "delay": delay_sec,
+                    "send_as": send_as_val,
+                    "schedule": schedule,
+                })
+                normalize_task_entry(task)
+                save_json(TASKS, tasks_state)
+                try:
+                    scheduler.remove_job(str(tid))
+                except Exception:
+                    pass
+                add_job_from_task(task)
+                status = "ON" if task.get("enabled", True) else "OFF"
+                summary = f"{len(messages)}条消息，消息延迟{delay_sec}s，状态{status}"
+                if send_as_val == SEND_AS_DISABLE:
+                    summary += "，发言ID=禁用"
+                elif send_as_val:
+                    summary += f"，发言ID {send_as_val}"
                 else:
-                    await e.reply("发言ID 需为数字ID、`-`（本账号）或 `none`（禁用）。", parse_mode="md"); return
-            # 验证 cron & 账号
-            schedule = classify_schedule(cron_expr)
-            if alias not in ensure_accounts()["users"]:
-                await e.reply("账号别名不存在，请先 /listusers 查看或 /adduser 登陆。"); return
-            await ensure_send_as_permission(cfg["api_id"], cfg["api_hash"], alias, send_as_val)
-            task.update({
-                "target": target,
-                "cron": cron_expr,
-                "messages": messages,
-                "account": alias,
-                "remark": remark,
-                "delay": delay_sec,
-                "send_as": send_as_val,
-                "schedule": schedule,
-            })
-            normalize_task_entry(task)
-            save_json(TASKS, tasks_state)
-            try:
-                scheduler.remove_job(str(tid))
-            except Exception:
-                pass
-            add_job_from_task(task)
-            status = "ON" if task.get("enabled", True) else "OFF"
-            summary = f"{len(messages)}条消息，消息延迟{delay_sec}s，状态{status}"
-            if send_as_val == SEND_AS_DISABLE:
-                summary += "，发言ID=禁用"
-            elif send_as_val:
-                summary += f"，发言ID {send_as_val}"
+                    summary += "，发言ID=本账号"
+                await e.reply(f"✅ 任务 #{tid} 已更新。\n[{alias}] {cron_expr} -> {target}\n{summary}")
             else:
-                summary += "，发言ID=本账号"
-            await e.reply(f"✅ 任务 #{tid} 已更新。\n[{alias}] {cron_expr} -> {target}\n{summary}")
+                if len(parts) < 4:
+                    await e.reply("格式：`/edittask TID | 模板ID | CRON/间隔 | 账号别名 | 备注 | 消息延迟(-=无) | 发言ID(-=自账号)`", parse_mode="md"); return
+                tpl_txt, cron_expr, alias = parts[1], parts[2], parts[3]
+                if not tpl_txt.isdigit():
+                    await e.reply("模板ID 需为数字。"); return
+                tpl_id = int(tpl_txt)
+                tpl = find_template(tpl_id)
+                if not tpl:
+                    await e.reply("模板ID不存在，请先 /listtpl 查看。"); return
+                remark = parts[4] if len(parts) >= 5 else task.get("remark", "")
+                delay_txt = parts[5] if len(parts) >= 6 else ""
+                send_as_txt = parts[6] if len(parts) >= 7 else ""
+                delay_sec = task.get("delay", 0)
+                if delay_txt:
+                    if delay_txt != FIELD_PLACEHOLDER:
+                        if delay_txt.isdigit():
+                            delay_sec = max(0, int(delay_txt))
+                        else:
+                            await e.reply("消息延迟需为非负整数，或使用 `-` 表示不设置。", parse_mode="md"); return
+                send_as_val = task.get("send_as")
+                if send_as_txt:
+                    txt = send_as_txt.strip()
+                    low = txt.lower()
+                    if txt == FIELD_PLACEHOLDER:
+                        send_as_val = None
+                    elif low in SEND_AS_DISABLE_KEYWORDS:
+                        send_as_val = SEND_AS_DISABLE
+                    elif txt.lstrip("-").isdigit():
+                        send_as_val = txt
+                    else:
+                        await e.reply("发言ID 需为数字ID、`-`（本账号）或 `none`（禁用）。", parse_mode="md"); return
+                schedule = classify_schedule(cron_expr)
+                if alias not in ensure_accounts()["users"]:
+                    await e.reply("账号别名不存在，请先 /listusers 查看或 /adduser 登陆。"); return
+                await ensure_send_as_permission(cfg["api_id"], cfg["api_hash"], alias, send_as_val)
+                task.update({
+                    "template_id": tpl_id,
+                    "cron": cron_expr,
+                    "schedule": schedule,
+                    "account": alias,
+                    "remark": remark,
+                    "delay": delay_sec,
+                    "send_as": send_as_val,
+                })
+                normalize_template_task_entry(task)
+                save_template_tasks()
+                try:
+                    scheduler.remove_job(template_job_id(tid))
+                except Exception:
+                    pass
+                add_job_from_template_task(task)
+                status = "ON" if task.get("enabled", True) else "OFF"
+                summary = f"模板:{tpl.get('name', f'模板{tpl_id}')}(#{tpl_id})，消息延迟{delay_sec}s，状态{status}"
+                if send_as_val == SEND_AS_DISABLE:
+                    summary += "，发言ID=禁用"
+                elif send_as_val:
+                    summary += f"，发言ID {send_as_val}"
+                else:
+                    summary += "，发言ID=本账号"
+                target_desc = tpl["target"]
+                await e.reply(f"✅ 模板任务 #T{tid} 已更新。\n[{alias}] {cron_expr} -> {target_desc}\n{summary}")
         except Exception as ex:
             await e.reply(f"❌ 修改失败：{ex}")
 
     @bot.on(events.NewMessage(pattern=r"^/listtasks$"))
     async def _(e):
         if not admin_ok(e): return
-        if not tasks_state["tasks"]:
+        if not tasks_state["tasks"] and not template_tasks_state["tasks"]:
             await e.reply("暂无任务。"); return
         lines = []
         for t in tasks_state["tasks"]:
@@ -773,49 +980,87 @@ async def main():
             extra = f" 共{len(t['messages'])}条" if len(t["messages"]) > 1 else ""
             delay_val = t.get("delay", 0)
             delay_txt = f" 消息延迟:{delay_val}s" if delay_val else ""
-            if t.get("send_as") == SEND_AS_DISABLE:
-                send_as_txt = " 发言:禁用"
-            elif t.get("send_as"):
-                send_as_txt = f" 发言:{t['send_as']}"
-            else:
-                send_as_txt = " 发言:自账号"
+            send_as_txt = f" {send_as_text(t.get('send_as'))}"
             lines.append(
                 f"#{t['id']} [{'ON' if t.get('enabled', True) else 'OFF'}] "
                 f"[{t['account']}] {t['cron']} -> {t['target']} | {preview}{extra}{delay_txt}{send_as_txt} "
                 f"｜备注:{(t.get('remark') or '无')}"
             )
+        for tt in template_tasks_state["tasks"]:
+            normalize_template_task_entry(tt)
+            name, target, preview = template_brief(tt)
+            delay_val = tt.get("delay", 0)
+            delay_txt = f" 消息延迟:{delay_val}s" if delay_val else ""
+            send_as_txt = f" {send_as_text(tt.get('send_as'))}"
+            next_info = describe_template_next_run(tt)
+            lines.append(
+                f"#T{tt['id']} [{'ON' if tt.get('enabled', True) else 'OFF'}] "
+                f"[{tt['account']}] 模板:{name}(#{tt['template_id']}) -> {target} | {preview}{delay_txt}{send_as_txt} "
+                f"｜备注:{(tt.get('remark') or '无')} ｜下次：{next_info}"
+            )
         await e.reply("📋 任务列表：\n" + "\n".join(lines))
 
-    @bot.on(events.NewMessage(pattern=r"^/deltask\s+(\d+)"))
+    @bot.on(events.NewMessage(pattern=r"^/deltask\s+(.+)"))
     async def _(e):
         if not admin_ok(e): return
-        tid = int(e.pattern_match.group(1))
-        before = len(tasks_state["tasks"])
-        tasks_state["tasks"] = [x for x in tasks_state["tasks"] if x["id"] != tid]
-        save_json(TASKS, tasks_state)
-        try:
-            scheduler.remove_job(str(tid))
-        except Exception:
-            pass
-        await e.reply("✅ 已删除" if len(tasks_state["tasks"]) < before else "未找到该ID")
+        token = e.pattern_match.group(1).strip()
+        parsed = parse_task_id(token)
+        if not parsed:
+            await e.reply("格式：`/deltask ID`，模板任务请使用 `T` 开头（如 T3）。", parse_mode="md"); return
+        kind, tid = parsed
+        removed = False
+        if kind == "normal":
+            before = len(tasks_state["tasks"])
+            tasks_state["tasks"] = [x for x in tasks_state["tasks"] if x["id"] != tid]
+            save_json(TASKS, tasks_state)
+            removed = len(tasks_state["tasks"]) < before
+            if removed:
+                try:
+                    scheduler.remove_job(str(tid))
+                except Exception:
+                    pass
+        else:
+            before = len(template_tasks_state["tasks"])
+            template_tasks_state["tasks"] = [x for x in template_tasks_state["tasks"] if x["id"] != tid]
+            save_template_tasks()
+            removed = len(template_tasks_state["tasks"]) < before
+            if removed:
+                try:
+                    scheduler.remove_job(template_job_id(tid))
+                except Exception:
+                    pass
+        if removed:
+            await e.reply(f"✅ 已删除任务 {'#T' if kind == 'template' else '#'}{tid}")
+        else:
+            await e.reply("未找到该ID")
 
-    @bot.on(events.NewMessage(pattern=r"^/toggle\s+(\d+)"))
+    @bot.on(events.NewMessage(pattern=r"^/toggle\s+(.+)"))
     async def _(e):
         if not admin_ok(e): return
-        tid = int(e.pattern_match.group(1))
-        t = next((x for x in tasks_state["tasks"] if x["id"] == tid), None)
-        if not t:
+        token = e.pattern_match.group(1).strip()
+        parsed = parse_task_id(token)
+        if not parsed:
+            await e.reply("格式：`/toggle ID`，模板任务使用 T 开头，例如 `T2`。", parse_mode="md"); return
+        kind, tid = parsed
+        task = find_task_by_kind(kind, tid)
+        if not task:
             await e.reply("未找到该ID"); return
-        t["enabled"] = not t.get("enabled", True)
-        save_json(TASKS, tasks_state)
+        task["enabled"] = not task.get("enabled", True)
+        if kind == "normal":
+            save_json(TASKS, tasks_state)
+        else:
+            save_template_tasks()
         try:
-            if t["enabled"]:
-                add_job_from_task(t)
+            if task["enabled"]:
+                if kind == "normal":
+                    add_job_from_task(task)
+                else:
+                    add_job_from_template_task(task)
             else:
-                scheduler.remove_job(str(tid))
+                scheduler.remove_job(str(tid) if kind == "normal" else template_job_id(tid))
         except Exception:
             pass
-        await e.reply(f"任务 #{tid} 已切换为 {'ON' if t['enabled'] else 'OFF'}")
+        await e.reply(f"任务 {'#T' if kind == 'template' else '#'}{tid} 已切换为 {'ON' if task['enabled'] else 'OFF'}")
 
     @bot.on(events.NewMessage(pattern=r"^/test\s+(.+)"))
     async def _(e):
@@ -856,26 +1101,159 @@ async def main():
         except Exception as ex:
             await e.reply(f"❌ 发送失败：{ex}")
 
+    @bot.on(events.NewMessage(pattern=r"^/listtpl$"))
+    async def _(e):
+        if not admin_ok(e): return
+        if not templates_state["templates"]:
+            await e.reply("暂无模板。"); return
+        lines = []
+        for tpl in templates_state["templates"]:
+            msg_preview = tpl["messages"][0][:40] + ("..." if len(tpl["messages"][0]) > 40 else "")
+            lines.append(f"#{tpl['id']} {tpl.get('name','(未命名)')} -> {tpl['target']} | {msg_preview}")
+        await e.reply("📐 模板列表：\n" + "\n".join(lines))
+
+    @bot.on(events.NewMessage(pattern=r"^/addtpl\s+(.+)"))
+    async def _(e):
+        if not admin_ok(e): return
+        try:
+            body = e.pattern_match.group(1).strip()
+            parts = [x.strip() for x in body.split("|")]
+            if len(parts) < 3:
+                await e.reply("格式：`/addtpl 名称 | 目标 | 文本(多条用||)`"); return
+            name, target, text_field = parts[0], parts[1], parts[2]
+            messages = [m.strip() for m in text_field.split("||") if m.strip()]
+            if not messages:
+                await e.reply("模板文本不能为空，可用 `||` 分隔多条。"); return
+            tid = templates_state["seq"]; templates_state["seq"] += 1
+            tpl = {"id": tid, "name": name or f"模板{tid}", "target": target, "messages": messages}
+            templates_state["templates"].append(tpl); save_templates()
+            await e.reply(f"✅ 已添加模板 #{tid} {tpl['name']}")
+        except Exception as ex:
+            await e.reply(f"❌ 添加模板失败：{ex}")
+
+    @bot.on(events.NewMessage(pattern=r"^/edittpl\s+(.+)"))
+    async def _(e):
+        if not admin_ok(e): return
+        try:
+            body = e.pattern_match.group(1).strip()
+            parts = [x.strip() for x in body.split("|")]
+            if len(parts) < 4 or not parts[0].isdigit():
+                await e.reply("格式：`/edittpl ID | 名称 | 目标 | 文本(多条用||)`"); return
+            tid = int(parts[0]); name = parts[1]; target = parts[2]; text_field = parts[3]
+            tpl = find_template(tid)
+            if not tpl:
+                await e.reply("未找到该模板 ID。"); return
+            messages = [m.strip() for m in text_field.split("||") if m.strip()]
+            if not messages:
+                await e.reply("模板文本不能为空。"); return
+            tpl.update({"name": name or tpl.get("name", f"模板{tid}"), "target": target, "messages": messages})
+            save_templates()
+            # 重新调度相关模板任务
+            for tt in template_tasks_state["tasks"]:
+                if tt["template_id"] == tid:
+                    try:
+                        scheduler.remove_job(template_job_id(tt["id"]))
+                    except Exception:
+                        pass
+                    add_job_from_template_task(tt)
+            await e.reply(f"✅ 模板 #{tid} 已更新，并同步到相关任务。")
+        except Exception as ex:
+            await e.reply(f"❌ 修改模板失败：{ex}")
+
+    @bot.on(events.NewMessage(pattern=r"^/addtpltask\s+(.+)"))
+    async def _(e):
+        if not admin_ok(e): return
+        try:
+            body = e.pattern_match.group(1).strip()
+            parts = split_command_fields(body)
+            if len(parts) < 4 or not parts[0].isdigit():
+                await e.reply("格式：`/addtpltask 模板ID | CRON/间隔 | 账号别名 | 备注 | 消息延迟(-=无) | 发言ID(-=自账号)`", parse_mode="md"); return
+            tpl_id = int(parts[0])
+            schedule_expr = parts[1]
+            alias = parts[2]
+            remark = parts[3] if len(parts) >= 4 else ""
+            delay_txt = parts[4] if len(parts) >= 5 else ""
+            send_as_txt = parts[5] if len(parts) >= 6 else ""
+            tpl = find_template(tpl_id)
+            if not tpl:
+                await e.reply("模板ID不存在，请先 /listtpl 查看。"); return
+            schedule = classify_schedule(schedule_expr)
+            if alias not in ensure_accounts()["users"]:
+                await e.reply("账号别名不存在，请先 /listusers 查看或 /adduser 登陆。"); return
+            delay_sec = 0
+            if delay_txt and delay_txt != FIELD_PLACEHOLDER:
+                if delay_txt.isdigit():
+                    delay_sec = max(0, int(delay_txt))
+                else:
+                    await e.reply("消息延迟需为非负整数，或使用 `-` 表示不设置。", parse_mode="md"); return
+            send_as_val = None
+            if send_as_txt:
+                txt = send_as_txt.strip()
+                low = txt.lower()
+                if txt == FIELD_PLACEHOLDER:
+                    send_as_val = None
+                elif low in SEND_AS_DISABLE_KEYWORDS:
+                    send_as_val = SEND_AS_DISABLE
+                elif txt.lstrip("-").isdigit():
+                    send_as_val = txt
+                else:
+                    await e.reply("发言ID 需为数字ID、`-`（本账号）或 `none`（禁用）。", parse_mode="md"); return
+            await ensure_send_as_permission(cfg["api_id"], cfg["api_hash"], alias, send_as_val)
+            tid = template_tasks_state["seq"]; template_tasks_state["seq"] += 1
+            task = {
+                "id": tid,
+                "template_id": tpl_id,
+                "cron": schedule_expr,
+                "schedule": schedule,
+                "account": alias,
+                "remark": remark,
+                "delay": delay_sec,
+                "send_as": send_as_val,
+                "enabled": True,
+            }
+            template_tasks_state["tasks"].append(task); save_template_tasks()
+            add_job_from_template_task(task)
+            await e.reply(f"✅ 已基于模板 #{tpl_id} 创建任务 #T{tid}")
+        except Exception as ex:
+            await e.reply(f"❌ 创建模板任务失败：{ex}")
+
     @bot.on(events.NewMessage(pattern=r"^/nextinterval(?:\s+(.*))?$"))
     async def _(e):
         if not admin_ok(e): return
         arg = (e.pattern_match.group(1) or "").strip()
-        interval_tasks = [t for t in tasks_state["tasks"] if is_interval_task(t)]
+        interval_tasks = get_all_interval_tasks()
         if not interval_tasks:
             await e.reply("暂无间隔任务。"); return
         if not arg or arg.lower() == "all":
             lines = []
-            for t in interval_tasks:
-                info = describe_next_run(t)
-                lines.append(f"#{t['id']} [{t['account']}] -> {t['target']}  {info}")
+            for kind, task in interval_tasks:
+                if kind == "normal":
+                    info = describe_next_run(task)
+                    target = task["target"]
+                    label = f"#{task['id']}"
+                else:
+                    info = describe_template_next_run(task)
+                    tpl = find_template(task["template_id"])
+                    target = tpl["target"] if tpl else "(模板缺失)"
+                    label = f"#T{task['id']}"
+                lines.append(f"{label} [{task['account']}] -> {target}  {info}")
             await e.reply("⏱ 间隔任务计划：\n" + "\n".join(lines)); return
-        if not arg.isdigit():
-            await e.reply("参数需为任务ID或 all。"); return
-        tid = int(arg)
-        task = next((x for x in interval_tasks if x["id"] == tid), None)
+        parsed = parse_task_id(arg)
+        if not parsed:
+            await e.reply("参数需为任务ID或 all，模板任务使用 T 开头，例如 T1。"); return
+        kind, tid = parsed
+        task = find_task_by_kind(kind, tid)
         if not task:
             await e.reply("未找到该间隔任务ID。"); return
-        await e.reply(f"#{tid} 下一次执行：{describe_next_run(task)}")
+        if kind == "normal":
+            if not is_interval_task(task):
+                await e.reply("该任务不是间隔任务。"); return
+            await e.reply(f"#{tid} 下一次执行：{describe_next_run(task)}")
+        else:
+            normalize_template_task_entry(task)
+            if task.get("schedule", {}).get("mode") != "interval":
+                await e.reply("该任务不是间隔任务。"); return
+            await e.reply(f"#T{tid} 下一次执行：{describe_template_next_run(task)}")
 
     @bot.on(events.NewMessage(pattern=r"^/delaynext\s+(.+)"))
     async def _(e):
@@ -883,9 +1261,12 @@ async def main():
         try:
             body = e.pattern_match.group(1).strip()
             parts = [x.strip() for x in body.split("|")]
-            if len(parts) != 2 or not parts[0].isdigit():
+            if len(parts) != 2:
                 await e.reply("格式：`/delaynext ID | 秒数/间隔(如 30s 5m)`"); return
-            tid = int(parts[0])
+            parsed = parse_task_id(parts[0])
+            if not parsed:
+                await e.reply("任务ID不正确，模板任务请使用 `T1` 这种格式。"); return
+            kind, tid = parsed
             delta_expr = parts[1]
             try:
                 delta_schedule = classify_schedule(delta_expr)
@@ -899,15 +1280,25 @@ async def main():
                     await e.reply("请输入合法的秒数或间隔，如 60 / 30s / 5m。"); return
             if secs < 0:
                 await e.reply("秒数需为非负整数。"); return
-            task = next((x for x in tasks_state["tasks"] if x["id"] == tid), None)
-            if not task or not is_interval_task(task):
-                await e.reply("该任务不存在或不是间隔任务。"); return
-            job = scheduler.get_job(str(tid))
+            task = find_task_by_kind(kind, tid)
+            if not task:
+                await e.reply("未找到该任务。"); return
+            if kind == "normal":
+                if not is_interval_task(task):
+                    await e.reply("该任务不是间隔任务。"); return
+                job_id = str(tid)
+            else:
+                normalize_template_task_entry(task)
+                if task.get("schedule", {}).get("mode") != "interval":
+                    await e.reply("该任务不是间隔任务。"); return
+                job_id = template_job_id(tid)
+            job = scheduler.get_job(job_id)
             if not job:
                 await e.reply("未找到该任务的调度。"); return
             new_time = datetime.now(SH_TZ) + timedelta(seconds=secs)
             job.modify(next_run_time=new_time)
-            await e.reply(f"✅ 已将任务 #{tid} 的下一次执行时间调整为 {new_time.strftime('%Y-%m-%d %H:%M:%S')}，约 {format_seconds(secs)} 后执行。")
+            label = f"#T{tid}" if kind == "template" else f"#{tid}"
+            await e.reply(f"✅ 已将任务 {label} 的下一次执行时间调整为 {new_time.strftime('%Y-%m-%d %H:%M:%S')}，约 {format_seconds(secs)} 后执行。")
         except Exception as ex:
             await e.reply(f"❌ 调整失败：{ex}")
 
