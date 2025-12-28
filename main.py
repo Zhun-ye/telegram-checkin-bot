@@ -87,6 +87,119 @@ def format_seconds(sec: int) -> str:
     parts.append(f"{s}s")
     return "".join(parts)
 
+def parse_aliases(value) -> list[str]:
+    """解析账号别名字段，支持逗号分隔或列表输入。"""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        raw = value
+    else:
+        raw = str(value).split(",")
+    aliases = [str(x).strip() for x in raw if str(x).strip()]
+    return aliases
+
+def normalize_accounts(task: dict) -> bool:
+    """统一任务的账号字段：accounts 列表 + account 逗号串。"""
+    changed = False
+    accounts_raw = task.get("accounts")
+    if accounts_raw is None:
+        account_field = task.get("account")
+        accounts = parse_aliases(account_field)
+    else:
+        accounts = parse_aliases(accounts_raw)
+    if accounts_raw != accounts:
+        task["accounts"] = accounts
+        changed = True
+    account_label = ",".join(accounts) if accounts else ""
+    if task.get("account") != account_label:
+        task["account"] = account_label
+        changed = True
+    return changed
+
+def normalize_send_as(task: dict) -> bool:
+    """统一 send_as 为列表或单值；支持旧字符串逗号分隔。"""
+    changed = False
+    send_as_raw = task.get("send_as")
+    if isinstance(send_as_raw, list):
+        send_as_list = [str(x).strip() for x in send_as_raw if str(x).strip()]
+        if send_as_list != send_as_raw:
+            task["send_as"] = send_as_list
+            changed = True
+    elif isinstance(send_as_raw, str) and "," in send_as_raw:
+        send_as_list = [x.strip() for x in send_as_raw.split(",") if x.strip()]
+        task["send_as"] = send_as_list
+        changed = True
+    return changed
+
+def iter_task_accounts(task: dict) -> list[str]:
+    """读取任务账号列表，兼容旧 account 字符串。"""
+    accounts = task.get("accounts")
+    if not accounts:
+        accounts = parse_aliases(task.get("account"))
+    return accounts
+
+def iter_task_send_as(task: dict) -> list:
+    """读取 send_as 列表，单值时返回单元素列表。"""
+    send_as_val = task.get("send_as")
+    if isinstance(send_as_val, list):
+        return send_as_val or [None]
+    return [send_as_val]
+
+def format_accounts(task: dict) -> str:
+    """用于展示的账号别名串。"""
+    accounts = iter_task_accounts(task)
+    return ",".join(accounts) if accounts else ""
+
+def format_send_as(val) -> str:
+    """用于展示的发言ID描述。"""
+    if isinstance(val, list):
+        if not val:
+            return "发言:自账号"
+        if any(v == SEND_AS_DISABLE for v in val):
+            return "发言:禁用"
+        return f"发言:{','.join(str(v) for v in val)}"
+    if val == SEND_AS_DISABLE:
+        return "发言:禁用"
+    if val:
+        return f"发言:{val}"
+    return "发言:自账号"
+
+def parse_send_as_input(send_as_txt: str, allow_multi: bool):
+    """解析发言ID输入：支持 none/-, 以及单账号多ID。"""
+    if not send_as_txt:
+        return None
+    txt = send_as_txt.strip()
+    if not txt or txt == FIELD_PLACEHOLDER:
+        return None
+    low = txt.lower()
+    if low in SEND_AS_DISABLE_KEYWORDS:
+        return SEND_AS_DISABLE
+    if allow_multi and "," in txt:
+        vals = []
+        for token in txt.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            if token.lstrip("-").isdigit():
+                vals.append(token)
+            else:
+                raise ValueError("发言ID 需为数字ID、`-`（本账号）或 `none`（禁用）。")
+        return vals or None
+    if txt.lstrip("-").isdigit():
+        return txt
+    raise ValueError("发言ID 需为数字ID、`-`（本账号）或 `none`（禁用）。")
+
+def validate_accounts(aliases: list[str], accounts_data: dict):
+    """校验账号别名是否存在。"""
+    for alias in aliases:
+        if alias not in accounts_data:
+            raise ValueError(f"账号别名不存在：{alias}")
+
+def validate_multi_account_send_as(aliases: list[str], send_as_val):
+    """多账号任务不允许发言ID。"""
+    if len(aliases) > 1 and send_as_val not in (None, SEND_AS_DISABLE):
+        raise ValueError("多账号任务不支持发言ID，请使用 `-` 或 `none`。")
+
 # ---------------- 基础工具 ----------------
 def load_json(path: Path, default):
     if path.exists():
@@ -281,6 +394,8 @@ def ensure_template_tasks():
 
 def normalize_task_entry(task: dict) -> bool:
     changed = False
+    if normalize_accounts(task):
+        changed = True
     msgs_missing = "messages" not in task
     msgs = task.get("messages")
     if not isinstance(msgs, list) or not msgs:
@@ -322,6 +437,8 @@ def normalize_task_entry(task: dict) -> bool:
     if send_as_missing or task.get("send_as") != send_as_val:
         task["send_as"] = send_as_val
         changed = True
+    if normalize_send_as(task):
+        changed = True
 
     schedule = task.get("schedule")
     if not schedule:
@@ -339,6 +456,10 @@ def normalize_task_entry(task: dict) -> bool:
 
 def normalize_template_task_entry(task: dict) -> bool:
     changed = False
+    if normalize_accounts(task):
+        changed = True
+    if normalize_send_as(task):
+        changed = True
     schedule = task.get("schedule")
     if not schedule:
         expr = task.get("cron") or task.get("schedule_expr") or ""
@@ -482,10 +603,21 @@ async def main():
             return
         normalize_task_entry(t)
         remark = t.get("remark") or "无备注"
-        info = f"任务#{task_id} [{t['account']}] -> {t['target']}（备注：{remark}）"
+        info = f"任务#{task_id} [{format_accounts(t)}] -> {t['target']}（备注：{remark}）"
         try:
-            await send_with_user(cfg["api_id"], cfg["api_hash"], t["account"], t["target"],
-                                 t["messages"], t.get("delay", 0), t.get("send_as"))
+            accounts = iter_task_accounts(t)
+            send_as_values = iter_task_send_as(t)
+            for alias in accounts:
+                for send_as_val in send_as_values:
+                    await send_with_user(
+                        cfg["api_id"],
+                        cfg["api_hash"],
+                        alias,
+                        t["target"],
+                        t["messages"],
+                        t.get("delay", 0),
+                        send_as_val,
+                    )
             await send_log_message(f"✅ {info} 已执行。")
         except Exception as exc:
             await send_log_message(f"❌ {info} 发送失败：{exc}")
@@ -501,10 +633,24 @@ async def main():
             await send_log_message(f"⚠️ 模板任务 T{task_id} 找不到模板 #{tt['template_id']}。")
             return
         normalize_template_task_entry(tt)
-        info = f"模板任务T{task_id} [{tt['account']}] 模板:{tpl.get('name', tt['template_id'])} -> {tpl['target']}（备注：{tt.get('remark') or '无备注'}）"
+        info = (
+            f"模板任务T{task_id} [{format_accounts(tt)}] "
+            f"模板:{tpl.get('name', tt['template_id'])} -> {tpl['target']}（备注：{tt.get('remark') or '无备注'}）"
+        )
         try:
-            await send_with_user(cfg["api_id"], cfg["api_hash"], tt["account"], tpl["target"],
-                                 tpl["messages"], tt.get("delay", 0), tt.get("send_as"))
+            accounts = iter_task_accounts(tt)
+            send_as_values = iter_task_send_as(tt)
+            for alias in accounts:
+                for send_as_val in send_as_values:
+                    await send_with_user(
+                        cfg["api_id"],
+                        cfg["api_hash"],
+                        alias,
+                        tpl["target"],
+                        tpl["messages"],
+                        tt.get("delay", 0),
+                        send_as_val,
+                    )
             await send_log_message(f"✅ {info} 已执行。")
         except Exception as exc:
             await send_log_message(f"❌ {info} 发送失败：{exc}")
@@ -610,11 +756,7 @@ async def main():
         return next((x for x in template_tasks_state["tasks"] if x["id"] == task_id), None)
 
     def send_as_text(val):
-        if val == SEND_AS_DISABLE:
-            return "发言:禁用"
-        if val:
-            return f"发言:{val}"
-        return "发言:自账号"
+        return format_send_as(val)
 
     def template_brief(tt):
         tpl = find_template(tt["template_id"])
@@ -641,6 +783,7 @@ async def main():
             "`/nextinterval ID` 查看某个间隔任务剩余时间；`/nextinterval all` 查看全部间隔任务\n"
             "`/delaynext ID | 秒数/间隔` 临时调整间隔任务的下一次执行时间\n"
             "占位符 `-` 表示不设置；发言ID=none 可禁用 send-as；消息延迟=多条消息之间等待时间\n\n"
+            "账号别名支持 `a,b,c` 多账号（需发言ID为空或 none）；单账号时发言ID可用逗号分隔多个ID\n\n"
             "—— *任务模板* ——\n"
             "`/listtpl` 查看模板列表\n"
             "`/addtpl` 名称 `|` 目标 `|` 文本(多条用`||`)\n"
@@ -773,7 +916,7 @@ async def main():
             parts = split_command_fields(body)
             if len(parts) < 4:
                 await e.reply("格式：`/addtask 目标 | CRON/间隔 | 文本 | 账号别名 | 备注 | 消息延迟(-=不设) | 发言ID(-=自账号)`", parse_mode="md"); return
-            target, cron_expr, text_field, alias = parts[0], parts[1], parts[2], parts[3]
+            target, cron_expr, text_field, alias_field = parts[0], parts[1], parts[2], parts[3]
             remark = parts[4] if len(parts) >= 5 else ""
             delay_txt = parts[5] if len(parts) >= 6 else ""
             send_as_txt = parts[6] if len(parts) >= 7 else ""
@@ -786,22 +929,26 @@ async def main():
                     delay_sec = max(0, int(delay_txt))
                 else:
                     await e.reply("消息延迟需为非负整数，或使用 `-` 表示不设置。", parse_mode="md"); return
-            send_as_val = None
-            if send_as_txt:
-                txt = send_as_txt.strip()
-                low = txt.lower()
-                if txt == FIELD_PLACEHOLDER:
-                    send_as_val = None
-                elif low in SEND_AS_DISABLE_KEYWORDS:
-                    send_as_val = SEND_AS_DISABLE
-                elif txt.lstrip("-").isdigit():
-                    send_as_val = txt
-                else:
-                    await e.reply("发言ID 需为数字ID、`-`（本账号）或 `none`（禁用）。", parse_mode="md"); return
+            aliases = parse_aliases(alias_field)
+            if not aliases:
+                await e.reply("账号别名不能为空。"); return
+            accounts_data = ensure_accounts()["users"]
+            try:
+                validate_accounts(aliases, accounts_data)
+            except ValueError as exc:
+                await e.reply(str(exc)); return
+            allow_multi_send_as = len(aliases) == 1
+            try:
+                send_as_val = parse_send_as_input(send_as_txt, allow_multi_send_as)
+                validate_multi_account_send_as(aliases, send_as_val)
+            except ValueError as exc:
+                await e.reply(str(exc), parse_mode="md"); return
             schedule = classify_schedule(cron_expr)
-            if alias not in ensure_accounts()["users"]:
-                await e.reply("账号别名不存在，请先 /listusers 查看或 /adduser 登陆。"); return
-            await ensure_send_as_permission(cfg["api_id"], cfg["api_hash"], alias, send_as_val)
+            if isinstance(send_as_val, list):
+                for val in send_as_val:
+                    await ensure_send_as_permission(cfg["api_id"], cfg["api_hash"], aliases[0], val)
+            else:
+                await ensure_send_as_permission(cfg["api_id"], cfg["api_hash"], aliases[0], send_as_val)
 
             tid = tasks_state["seq"]; tasks_state["seq"] += 1
             task = {
@@ -809,7 +956,8 @@ async def main():
                 "target": target,
                 "cron": cron_expr,
                 "messages": messages,
-                "account": alias,
+                "account": ",".join(aliases),
+                "accounts": aliases,
                 "remark": remark,
                 "delay": delay_sec,
                 "send_as": send_as_val,
@@ -819,13 +967,8 @@ async def main():
             tasks_state["tasks"].append(task); save_json(TASKS, tasks_state)
             add_job_from_task(task)
             summary = f"{len(messages)}条消息，消息延迟{delay_sec}s"
-            if send_as_val == SEND_AS_DISABLE:
-                summary += "，发言ID=禁用"
-            elif send_as_val:
-                summary += f"，发言ID {send_as_val}"
-            else:
-                summary += "，发言ID=自账号"
-            await e.reply(f"✅ 已添加任务 #{tid}\n[{alias}] {cron_expr} -> {target}\n{summary}\n备注：{remark or '（无）'}")
+            summary += f"，{format_send_as(send_as_val)}"
+            await e.reply(f"✅ 已添加任务 #{tid}\n[{','.join(aliases)}] {cron_expr} -> {target}\n{summary}\n备注：{remark or '（无）'}")
         except Exception as ex:
             await e.reply(f"❌ 添加失败：{ex}")
 
@@ -847,7 +990,7 @@ async def main():
             if kind == "normal":
                 if len(parts) < 5:
                     await e.reply("格式：`/edittask ID | 目标 | CRON/间隔 | 文本 | 账号别名 | 备注 | 消息延迟(-=不设) | 发言ID(-=自账号)`", parse_mode="md"); return
-                target, cron_expr, text_field, alias = parts[1], parts[2], parts[3], parts[4]
+                target, cron_expr, text_field, alias_field = parts[1], parts[2], parts[3], parts[4]
                 remark = parts[5] if len(parts) >= 6 else task.get("remark", "")
                 delay_txt = parts[6] if len(parts) >= 7 else ""
                 send_as_txt = parts[7] if len(parts) >= 8 else ""
@@ -861,27 +1004,36 @@ async def main():
                             delay_sec = max(0, int(delay_txt))
                         else:
                             await e.reply("消息延迟需为非负整数，或使用 `-` 表示不设置。", parse_mode="md"); return
+                aliases = parse_aliases(alias_field)
+                if not aliases:
+                    await e.reply("账号别名不能为空。"); return
+                accounts_data = ensure_accounts()["users"]
+                try:
+                    validate_accounts(aliases, accounts_data)
+                except ValueError as exc:
+                    await e.reply(str(exc)); return
                 send_as_val = task.get("send_as")
                 if send_as_txt:
-                    txt = send_as_txt.strip()
-                    low = txt.lower()
-                    if txt == FIELD_PLACEHOLDER:
-                        send_as_val = None
-                    elif low in SEND_AS_DISABLE_KEYWORDS:
-                        send_as_val = SEND_AS_DISABLE
-                    elif txt.lstrip("-").isdigit():
-                        send_as_val = txt
-                    else:
-                        await e.reply("发言ID 需为数字ID、`-`（本账号）或 `none`（禁用）。", parse_mode="md"); return
+                    try:
+                        send_as_val = parse_send_as_input(send_as_txt, len(aliases) == 1)
+                    except ValueError as exc:
+                        await e.reply(str(exc), parse_mode="md"); return
+                try:
+                    validate_multi_account_send_as(aliases, send_as_val)
+                except ValueError as exc:
+                    await e.reply(str(exc), parse_mode="md"); return
                 schedule = classify_schedule(cron_expr)
-                if alias not in ensure_accounts()["users"]:
-                    await e.reply("账号别名不存在，请先 /listusers 查看或 /adduser 登陆。"); return
-                await ensure_send_as_permission(cfg["api_id"], cfg["api_hash"], alias, send_as_val)
+                if isinstance(send_as_val, list):
+                    for val in send_as_val:
+                        await ensure_send_as_permission(cfg["api_id"], cfg["api_hash"], aliases[0], val)
+                else:
+                    await ensure_send_as_permission(cfg["api_id"], cfg["api_hash"], aliases[0], send_as_val)
                 task.update({
                     "target": target,
                     "cron": cron_expr,
                     "messages": messages,
-                    "account": alias,
+                    "account": ",".join(aliases),
+                    "accounts": aliases,
                     "remark": remark,
                     "delay": delay_sec,
                     "send_as": send_as_val,
@@ -895,18 +1047,12 @@ async def main():
                     pass
                 add_job_from_task(task)
                 status = "ON" if task.get("enabled", True) else "OFF"
-                summary = f"{len(messages)}条消息，消息延迟{delay_sec}s，状态{status}"
-                if send_as_val == SEND_AS_DISABLE:
-                    summary += "，发言ID=禁用"
-                elif send_as_val:
-                    summary += f"，发言ID {send_as_val}"
-                else:
-                    summary += "，发言ID=本账号"
-                await e.reply(f"✅ 任务 #{tid} 已更新。\n[{alias}] {cron_expr} -> {target}\n{summary}")
+                summary = f"{len(messages)}条消息，消息延迟{delay_sec}s，状态{status}，{format_send_as(send_as_val)}"
+                await e.reply(f"✅ 任务 #{tid} 已更新。\n[{','.join(aliases)}] {cron_expr} -> {target}\n{summary}")
             else:
                 if len(parts) < 4:
                     await e.reply("格式：`/edittask TID | 模板ID | CRON/间隔 | 账号别名 | 备注 | 消息延迟(-=无) | 发言ID(-=自账号)`", parse_mode="md"); return
-                tpl_txt, cron_expr, alias = parts[1], parts[2], parts[3]
+                tpl_txt, cron_expr, alias_field = parts[1], parts[2], parts[3]
                 if not tpl_txt.isdigit():
                     await e.reply("模板ID 需为数字。"); return
                 tpl_id = int(tpl_txt)
@@ -923,27 +1069,36 @@ async def main():
                             delay_sec = max(0, int(delay_txt))
                         else:
                             await e.reply("消息延迟需为非负整数，或使用 `-` 表示不设置。", parse_mode="md"); return
+                aliases = parse_aliases(alias_field)
+                if not aliases:
+                    await e.reply("账号别名不能为空。"); return
+                accounts_data = ensure_accounts()["users"]
+                try:
+                    validate_accounts(aliases, accounts_data)
+                except ValueError as exc:
+                    await e.reply(str(exc)); return
                 send_as_val = task.get("send_as")
                 if send_as_txt:
-                    txt = send_as_txt.strip()
-                    low = txt.lower()
-                    if txt == FIELD_PLACEHOLDER:
-                        send_as_val = None
-                    elif low in SEND_AS_DISABLE_KEYWORDS:
-                        send_as_val = SEND_AS_DISABLE
-                    elif txt.lstrip("-").isdigit():
-                        send_as_val = txt
-                    else:
-                        await e.reply("发言ID 需为数字ID、`-`（本账号）或 `none`（禁用）。", parse_mode="md"); return
+                    try:
+                        send_as_val = parse_send_as_input(send_as_txt, len(aliases) == 1)
+                    except ValueError as exc:
+                        await e.reply(str(exc), parse_mode="md"); return
+                try:
+                    validate_multi_account_send_as(aliases, send_as_val)
+                except ValueError as exc:
+                    await e.reply(str(exc), parse_mode="md"); return
                 schedule = classify_schedule(cron_expr)
-                if alias not in ensure_accounts()["users"]:
-                    await e.reply("账号别名不存在，请先 /listusers 查看或 /adduser 登陆。"); return
-                await ensure_send_as_permission(cfg["api_id"], cfg["api_hash"], alias, send_as_val)
+                if isinstance(send_as_val, list):
+                    for val in send_as_val:
+                        await ensure_send_as_permission(cfg["api_id"], cfg["api_hash"], aliases[0], val)
+                else:
+                    await ensure_send_as_permission(cfg["api_id"], cfg["api_hash"], aliases[0], send_as_val)
                 task.update({
                     "template_id": tpl_id,
                     "cron": cron_expr,
                     "schedule": schedule,
-                    "account": alias,
+                    "account": ",".join(aliases),
+                    "accounts": aliases,
                     "remark": remark,
                     "delay": delay_sec,
                     "send_as": send_as_val,
@@ -956,15 +1111,12 @@ async def main():
                     pass
                 add_job_from_template_task(task)
                 status = "ON" if task.get("enabled", True) else "OFF"
-                summary = f"模板:{tpl.get('name', f'模板{tpl_id}')}(#{tpl_id})，消息延迟{delay_sec}s，状态{status}"
-                if send_as_val == SEND_AS_DISABLE:
-                    summary += "，发言ID=禁用"
-                elif send_as_val:
-                    summary += f"，发言ID {send_as_val}"
-                else:
-                    summary += "，发言ID=本账号"
+                summary = (
+                    f"模板:{tpl.get('name', f'模板{tpl_id}')}(#{tpl_id})，消息延迟{delay_sec}s，"
+                    f"状态{status}，{format_send_as(send_as_val)}"
+                )
                 target_desc = tpl["target"]
-                await e.reply(f"✅ 模板任务 #T{tid} 已更新。\n[{alias}] {cron_expr} -> {target_desc}\n{summary}")
+                await e.reply(f"✅ 模板任务 #T{tid} 已更新。\n[{','.join(aliases)}] {cron_expr} -> {target_desc}\n{summary}")
         except Exception as ex:
             await e.reply(f"❌ 修改失败：{ex}")
 
@@ -983,7 +1135,7 @@ async def main():
             send_as_txt = f" {send_as_text(t.get('send_as'))}"
             lines.append(
                 f"#{t['id']} [{'ON' if t.get('enabled', True) else 'OFF'}] "
-                f"[{t['account']}] {t['cron']} -> {t['target']} | {preview}{extra}{delay_txt}{send_as_txt} "
+                f"[{format_accounts(t)}] {t['cron']} -> {t['target']} | {preview}{extra}{delay_txt}{send_as_txt} "
                 f"｜备注:{(t.get('remark') or '无')}"
             )
         for tt in template_tasks_state["tasks"]:
@@ -995,7 +1147,7 @@ async def main():
             next_info = describe_template_next_run(tt)
             lines.append(
                 f"#T{tt['id']} [{'ON' if tt.get('enabled', True) else 'OFF'}] "
-                f"[{tt['account']}] 模板:{name}(#{tt['template_id']}) -> {target} | {preview}{delay_txt}{send_as_txt} "
+                f"[{format_accounts(tt)}] 模板:{name}(#{tt['template_id']}) -> {target} | {preview}{delay_txt}{send_as_txt} "
                 f"｜备注:{(tt.get('remark') or '无')} ｜下次：{next_info}"
             )
         await e.reply("📋 任务列表：\n" + "\n".join(lines))
@@ -1071,7 +1223,7 @@ async def main():
             parts = split_command_fields(body)
             if len(parts) < 3:
                 await e.reply("格式：`/test 目标 | 文本 | 账号别名 | 消息延迟(-=不设) | 发言ID(-=自账号)`", parse_mode="md"); return
-            target, text_field, alias = parts[0], parts[1], parts[2]
+            target, text_field, alias_field = parts[0], parts[1], parts[2]
             delay_txt = parts[3] if len(parts) >= 4 else ""
             send_as_txt = parts[4] if len(parts) >= 5 else ""
             messages = [m.strip() for m in text_field.split("||") if m.strip()]
@@ -1083,21 +1235,29 @@ async def main():
                     delay_sec = max(0, int(delay_txt))
                 else:
                     await e.reply("消息延迟需为非负整数，或使用 `-` 表示不设置。", parse_mode="md"); return
-            send_as_val = None
-            if send_as_txt:
-                txt = send_as_txt.strip()
-                low = txt.lower()
-                if txt == FIELD_PLACEHOLDER:
-                    send_as_val = None
-                elif low in SEND_AS_DISABLE_KEYWORDS:
-                    send_as_val = SEND_AS_DISABLE
-                elif txt.lstrip("-").isdigit():
-                    send_as_val = txt
-                else:
-                    await e.reply("发言ID 需为数字ID、`-`（本账号）或 `none`（禁用）。", parse_mode="md"); return
-            await ensure_send_as_permission(cfg["api_id"], cfg["api_hash"], alias, send_as_val)
-            await send_with_user(cfg["api_id"], cfg["api_hash"], alias, target, messages, delay_sec, send_as_val)
-            await e.reply(f"✅ 已尝试发送（{alias}）")
+            aliases = parse_aliases(alias_field)
+            if not aliases:
+                await e.reply("账号别名不能为空。"); return
+            accounts_data = ensure_accounts()["users"]
+            try:
+                validate_accounts(aliases, accounts_data)
+            except ValueError as exc:
+                await e.reply(str(exc)); return
+            try:
+                send_as_val = parse_send_as_input(send_as_txt, len(aliases) == 1)
+                validate_multi_account_send_as(aliases, send_as_val)
+            except ValueError as exc:
+                await e.reply(str(exc), parse_mode="md"); return
+            if isinstance(send_as_val, list):
+                for val in send_as_val:
+                    await ensure_send_as_permission(cfg["api_id"], cfg["api_hash"], aliases[0], val)
+            else:
+                await ensure_send_as_permission(cfg["api_id"], cfg["api_hash"], aliases[0], send_as_val)
+            send_as_values = send_as_val if isinstance(send_as_val, list) else [send_as_val]
+            for alias in aliases:
+                for val in send_as_values:
+                    await send_with_user(cfg["api_id"], cfg["api_hash"], alias, target, messages, delay_sec, val)
+            await e.reply(f"✅ 已尝试发送（{','.join(aliases)}）")
         except Exception as ex:
             await e.reply(f"❌ 发送失败：{ex}")
 
@@ -1170,7 +1330,7 @@ async def main():
                 await e.reply("格式：`/addtpltask 模板ID | CRON/间隔 | 账号别名 | 备注 | 消息延迟(-=无) | 发言ID(-=自账号)`", parse_mode="md"); return
             tpl_id = int(parts[0])
             schedule_expr = parts[1]
-            alias = parts[2]
+            alias_field = parts[2]
             remark = parts[3] if len(parts) >= 4 else ""
             delay_txt = parts[4] if len(parts) >= 5 else ""
             send_as_txt = parts[5] if len(parts) >= 6 else ""
@@ -1178,34 +1338,38 @@ async def main():
             if not tpl:
                 await e.reply("模板ID不存在，请先 /listtpl 查看。"); return
             schedule = classify_schedule(schedule_expr)
-            if alias not in ensure_accounts()["users"]:
-                await e.reply("账号别名不存在，请先 /listusers 查看或 /adduser 登陆。"); return
+            aliases = parse_aliases(alias_field)
+            if not aliases:
+                await e.reply("账号别名不能为空。"); return
+            accounts_data = ensure_accounts()["users"]
+            try:
+                validate_accounts(aliases, accounts_data)
+            except ValueError as exc:
+                await e.reply(str(exc)); return
             delay_sec = 0
             if delay_txt and delay_txt != FIELD_PLACEHOLDER:
                 if delay_txt.isdigit():
                     delay_sec = max(0, int(delay_txt))
                 else:
                     await e.reply("消息延迟需为非负整数，或使用 `-` 表示不设置。", parse_mode="md"); return
-            send_as_val = None
-            if send_as_txt:
-                txt = send_as_txt.strip()
-                low = txt.lower()
-                if txt == FIELD_PLACEHOLDER:
-                    send_as_val = None
-                elif low in SEND_AS_DISABLE_KEYWORDS:
-                    send_as_val = SEND_AS_DISABLE
-                elif txt.lstrip("-").isdigit():
-                    send_as_val = txt
-                else:
-                    await e.reply("发言ID 需为数字ID、`-`（本账号）或 `none`（禁用）。", parse_mode="md"); return
-            await ensure_send_as_permission(cfg["api_id"], cfg["api_hash"], alias, send_as_val)
+            try:
+                send_as_val = parse_send_as_input(send_as_txt, len(aliases) == 1)
+                validate_multi_account_send_as(aliases, send_as_val)
+            except ValueError as exc:
+                await e.reply(str(exc), parse_mode="md"); return
+            if isinstance(send_as_val, list):
+                for val in send_as_val:
+                    await ensure_send_as_permission(cfg["api_id"], cfg["api_hash"], aliases[0], val)
+            else:
+                await ensure_send_as_permission(cfg["api_id"], cfg["api_hash"], aliases[0], send_as_val)
             tid = template_tasks_state["seq"]; template_tasks_state["seq"] += 1
             task = {
                 "id": tid,
                 "template_id": tpl_id,
                 "cron": schedule_expr,
                 "schedule": schedule,
-                "account": alias,
+                "account": ",".join(aliases),
+                "accounts": aliases,
                 "remark": remark,
                 "delay": delay_sec,
                 "send_as": send_as_val,
@@ -1236,7 +1400,7 @@ async def main():
                     tpl = find_template(task["template_id"])
                     target = tpl["target"] if tpl else "(模板缺失)"
                     label = f"#T{task['id']}"
-                lines.append(f"{label} [{task['account']}] -> {target}  {info}")
+                lines.append(f"{label} [{format_accounts(task)}] -> {target}  {info}")
             await e.reply("⏱ 间隔任务计划：\n" + "\n".join(lines)); return
         parsed = parse_task_id(arg)
         if not parsed:
