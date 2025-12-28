@@ -75,7 +75,7 @@ bash manage.sh update    # 从仓库更新到 /opt 并重启
 ### 任务管理
 ```
 /addtask 目标 | CRON/间隔 | 文本(多条用||) | 账号别名 | 备注 | 消息延迟s(-=无) | 发言ID(-=本账号/none=禁用)
-/edittask ID | 目标 | CRON/间隔 | 文本(多条用||) | 账号别名 | 备注 | 消息延迟s(-=无) | 发言ID(-=本账号/none=禁用)
+/edittask ID | 目标 | CRON/间隔 | 文本(多条用||) | 账号别名 | 备注 | 消息延迟s(-=无) | 发言ID(-=本账号/none=禁用)   # 编辑时字段用 `_` 可不修改
 /listtasks
 /deltask ID
 /toggle ID
@@ -84,7 +84,7 @@ bash manage.sh update    # 从仓库更新到 /opt 并重启
 /delaynext ID | 秒数              # 临时调整间隔任务的下一次执行时间
 /listtpl                              # 查看模板
 /addtpl 名称 | 目标 | 文本(多条用||)
-/edittpl ID | 名称 | 目标 | 文本(多条用||)
+/edittpl ID | 名称 | 目标 | 文本(多条用||)                                            # 编辑时字段用 `_` 可不修改
 /addtpltask 模板ID | CRON/间隔 | 账号别名 | 备注 | 消息延迟s(-=无) | 发言ID(-=本账号/none=禁用)
 ```
 > CRON 支持 6 字段（秒 分 时 日 月 周），也可直接写 `100s` / `380m` / `36h` 表示每隔一定秒/分/小时执行一次。模板任务 ID 以 `T` 开头（例如 `T1`），在 `/edittask`、`/deltask`、`/toggle`、`/nextinterval`、`/delaynext` 中都可以直接使用。

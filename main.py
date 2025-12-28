@@ -61,6 +61,7 @@ BOT_SESSION = str(TOKEN_DIR / "bot")  # 机器人会话
 SH_TZ = ZoneInfo("Asia/Shanghai")
 BOT_TOKEN_FILE = TOKEN_DIR / "bot_token"
 FIELD_PLACEHOLDER = "-"  # 命令中未设置字段的占位符
+EDIT_NOCHANGE_PLACEHOLDER = "_"  # 编辑命令中表示不修改字段的占位符
 SEND_AS_DISABLE = "__NO_SEND_AS__"
 SEND_AS_DISABLE_KEYWORDS = {"none", "no", "off", "0", "disable", "禁用"}
 INTERVAL_KEYWORD_MAP = {
@@ -199,6 +200,11 @@ def validate_multi_account_send_as(aliases: list[str], send_as_val):
     """多账号任务不允许发言ID。"""
     if len(aliases) > 1 and send_as_val not in (None, SEND_AS_DISABLE):
         raise ValueError("多账号任务不支持发言ID，请使用 `-` 或 `none`。")
+
+def is_edit_nochange(value: str | None) -> bool:
+    if value is None:
+        return False
+    return value.strip() == EDIT_NOCHANGE_PLACEHOLDER
 
 # ---------------- 基础工具 ----------------
 def load_json(path: Path, default):
@@ -776,18 +782,20 @@ async def main():
             "—— *任务管理* ——\n"
             "`/addtask` 目标 `|` CRON/间隔 `|` 文本(多条用`||`) `|` 账号别名 `|` 备注 `|` 消息延迟(`-`=无延迟) `|` 发言ID(`-`=本账号/none=禁用)\n"
             "`/edittask` ID `|` 目标 `|` CRON/间隔 `|` 文本(多条用`||`) `|` 账号别名 `|` 备注 `|` 消息延迟(`-`=无) `|` 发言ID(`-`=本账号/none=禁用)\n"
+            "编辑时字段用 `_` 可不修改\n"
             "`/listtasks`  列出任务\n"
             "`/deltask` ID 删除任务\n"
             "`/toggle` ID 启/停任务\n"
             "`/test` 目标 `|` 文本(多条用`||`) `|` 账号别名 `|` 消息延迟(`-`=无延迟) `|` 发言ID(`-`=本账号)  立即测试\n"
             "`/nextinterval ID` 查看某个间隔任务剩余时间；`/nextinterval all` 查看全部间隔任务\n"
             "`/delaynext ID | 秒数/间隔` 临时调整间隔任务的下一次执行时间\n"
-            "占位符 `-` 表示不设置；发言ID=none 可禁用 send-as；消息延迟=多条消息之间等待时间\n\n"
+            "占位符 `-` 表示不设置；编辑占位符 `_` 表示不修改字段；发言ID=none 可禁用 send-as；消息延迟=多条消息之间等待时间\n\n"
             "账号别名支持 `a,b,c` 多账号（需发言ID为空或 none）；单账号时多ID发言时发言ID可用逗号分隔多个ID\n\n"
             "—— *任务模板* ——\n"
             "`/listtpl` 查看模板列表\n"
             "`/addtpl` 名称 `|` 目标 `|` 文本(多条用`||`)\n"
             "`/edittpl` ID `|` 名称 `|` 目标 `|` 文本(多条用`||`)\n"
+            "编辑时字段用 `_` 可不修改\n"
             "`/addtpltask` 模板ID `|` CRON/间隔 `|` 账号 `|` 备注 `|` 消息延迟(`-`=无) `|` 发言ID(`-`/none)\n"
             "模板任务 ID 以 `T` 开头，例如 `T1`；`/edittask T1 | 模板ID | CRON/间隔 | 账号 | 备注 | 消息延迟 | 发言ID` 可修改\n\n"
             "—— *账号管理* ——\n"
@@ -989,22 +997,34 @@ async def main():
                 await e.reply("未找到该任务 ID。"); return
             if kind == "normal":
                 if len(parts) < 5:
-                    await e.reply("格式：`/edittask ID | 目标 | CRON/间隔 | 文本 | 账号别名 | 备注 | 消息延迟(-=不设) | 发言ID(-=自账号)`", parse_mode="md"); return
+                    await e.reply("格式：`/edittask ID | 目标 | CRON/间隔 | 文本 | 账号别名 | 备注 | 消息延迟(-=不设) | 发言ID(-=自账号)`，字段用 `_` 可不修改。", parse_mode="md"); return
                 target, cron_expr, text_field, alias_field = parts[1], parts[2], parts[3], parts[4]
+                if is_edit_nochange(target):
+                    target = task.get("target", "")
+                if is_edit_nochange(cron_expr):
+                    cron_expr = task.get("cron", "")
                 remark = parts[5] if len(parts) >= 6 else task.get("remark", "")
+                if is_edit_nochange(remark):
+                    remark = task.get("remark", "")
                 delay_txt = parts[6] if len(parts) >= 7 else ""
                 send_as_txt = parts[7] if len(parts) >= 8 else ""
-                messages = [m.strip() for m in text_field.split("||") if m.strip()]
-                if not messages:
-                    await e.reply("消息内容不能为空，可用 `||` 分隔多条。", parse_mode="md"); return
+                if is_edit_nochange(text_field):
+                    messages = task.get("messages", [])
+                else:
+                    messages = [m.strip() for m in text_field.split("||") if m.strip()]
+                    if not messages:
+                        await e.reply("消息内容不能为空，可用 `||` 分隔多条。", parse_mode="md"); return
                 delay_sec = task.get("delay", 0)
                 if delay_txt:
-                    if delay_txt != FIELD_PLACEHOLDER:
+                    if delay_txt not in (FIELD_PLACEHOLDER, EDIT_NOCHANGE_PLACEHOLDER):
                         if delay_txt.isdigit():
                             delay_sec = max(0, int(delay_txt))
                         else:
                             await e.reply("消息延迟需为非负整数，或使用 `-` 表示不设置。", parse_mode="md"); return
-                aliases = parse_aliases(alias_field)
+                if is_edit_nochange(alias_field):
+                    aliases = iter_task_accounts(task)
+                else:
+                    aliases = parse_aliases(alias_field)
                 if not aliases:
                     await e.reply("账号别名不能为空。"); return
                 accounts_data = ensure_accounts()["users"]
@@ -1013,7 +1033,7 @@ async def main():
                 except ValueError as exc:
                     await e.reply(str(exc)); return
                 send_as_val = task.get("send_as")
-                if send_as_txt:
+                if send_as_txt and not is_edit_nochange(send_as_txt):
                     try:
                         send_as_val = parse_send_as_input(send_as_txt, len(aliases) == 1)
                     except ValueError as exc:
@@ -1022,7 +1042,9 @@ async def main():
                     validate_multi_account_send_as(aliases, send_as_val)
                 except ValueError as exc:
                     await e.reply(str(exc), parse_mode="md"); return
-                schedule = classify_schedule(cron_expr)
+                schedule = task.get("schedule")
+                if not is_edit_nochange(cron_expr):
+                    schedule = classify_schedule(cron_expr)
                 if isinstance(send_as_val, list):
                     for val in send_as_val:
                         await ensure_send_as_permission(cfg["api_id"], cfg["api_hash"], aliases[0], val)
@@ -1051,25 +1073,35 @@ async def main():
                 await e.reply(f"✅ 任务 #{tid} 已更新。\n[{','.join(aliases)}] {cron_expr} -> {target}\n{summary}")
             else:
                 if len(parts) < 4:
-                    await e.reply("格式：`/edittask TID | 模板ID | CRON/间隔 | 账号别名 | 备注 | 消息延迟(-=无) | 发言ID(-=自账号)`", parse_mode="md"); return
+                    await e.reply("格式：`/edittask TID | 模板ID | CRON/间隔 | 账号别名 | 备注 | 消息延迟(-=无) | 发言ID(-=自账号)`，字段用 `_` 可不修改。", parse_mode="md"); return
                 tpl_txt, cron_expr, alias_field = parts[1], parts[2], parts[3]
-                if not tpl_txt.isdigit():
-                    await e.reply("模板ID 需为数字。"); return
-                tpl_id = int(tpl_txt)
+                if is_edit_nochange(tpl_txt):
+                    tpl_id = task.get("template_id")
+                else:
+                    if not tpl_txt.isdigit():
+                        await e.reply("模板ID 需为数字。"); return
+                    tpl_id = int(tpl_txt)
+                if is_edit_nochange(cron_expr):
+                    cron_expr = task.get("cron", "")
                 tpl = find_template(tpl_id)
                 if not tpl:
                     await e.reply("模板ID不存在，请先 /listtpl 查看。"); return
                 remark = parts[4] if len(parts) >= 5 else task.get("remark", "")
+                if is_edit_nochange(remark):
+                    remark = task.get("remark", "")
                 delay_txt = parts[5] if len(parts) >= 6 else ""
                 send_as_txt = parts[6] if len(parts) >= 7 else ""
                 delay_sec = task.get("delay", 0)
                 if delay_txt:
-                    if delay_txt != FIELD_PLACEHOLDER:
+                    if delay_txt not in (FIELD_PLACEHOLDER, EDIT_NOCHANGE_PLACEHOLDER):
                         if delay_txt.isdigit():
                             delay_sec = max(0, int(delay_txt))
                         else:
                             await e.reply("消息延迟需为非负整数，或使用 `-` 表示不设置。", parse_mode="md"); return
-                aliases = parse_aliases(alias_field)
+                if is_edit_nochange(alias_field):
+                    aliases = iter_task_accounts(task)
+                else:
+                    aliases = parse_aliases(alias_field)
                 if not aliases:
                     await e.reply("账号别名不能为空。"); return
                 accounts_data = ensure_accounts()["users"]
@@ -1078,7 +1110,7 @@ async def main():
                 except ValueError as exc:
                     await e.reply(str(exc)); return
                 send_as_val = task.get("send_as")
-                if send_as_txt:
+                if send_as_txt and not is_edit_nochange(send_as_txt):
                     try:
                         send_as_val = parse_send_as_input(send_as_txt, len(aliases) == 1)
                     except ValueError as exc:
@@ -1087,7 +1119,9 @@ async def main():
                     validate_multi_account_send_as(aliases, send_as_val)
                 except ValueError as exc:
                     await e.reply(str(exc), parse_mode="md"); return
-                schedule = classify_schedule(cron_expr)
+                schedule = task.get("schedule")
+                if not is_edit_nochange(cron_expr):
+                    schedule = classify_schedule(cron_expr)
                 if isinstance(send_as_val, list):
                     for val in send_as_val:
                         await ensure_send_as_permission(cfg["api_id"], cfg["api_hash"], aliases[0], val)
@@ -1298,14 +1332,21 @@ async def main():
             body = e.pattern_match.group(1).strip()
             parts = [x.strip() for x in body.split("|")]
             if len(parts) < 4 or not parts[0].isdigit():
-                await e.reply("格式：`/edittpl ID | 名称 | 目标 | 文本(多条用||)`"); return
+                await e.reply("格式：`/edittpl ID | 名称 | 目标 | 文本(多条用||)`，字段用 `_` 可不修改。"); return
             tid = int(parts[0]); name = parts[1]; target = parts[2]; text_field = parts[3]
             tpl = find_template(tid)
             if not tpl:
                 await e.reply("未找到该模板 ID。"); return
-            messages = [m.strip() for m in text_field.split("||") if m.strip()]
-            if not messages:
-                await e.reply("模板文本不能为空。"); return
+            if is_edit_nochange(name):
+                name = tpl.get("name", f"模板{tid}")
+            if is_edit_nochange(target):
+                target = tpl.get("target", "")
+            if is_edit_nochange(text_field):
+                messages = tpl.get("messages", [])
+            else:
+                messages = [m.strip() for m in text_field.split("||") if m.strip()]
+                if not messages:
+                    await e.reply("模板文本不能为空。"); return
             tpl.update({"name": name or tpl.get("name", f"模板{tid}"), "target": target, "messages": messages})
             save_templates()
             # 重新调度相关模板任务
