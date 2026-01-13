@@ -863,7 +863,8 @@ async def main():
             "`/listtasks`  列出任务\n"
             "`/deltask` ID 删除任务\n"
             "`/toggle` ID 启/停任务\n"
-            "`/test` 目标 `|` 文本(多条用`||`) `|` 账号别名 `|` 消息延迟(`-`=无延迟) `|` 发言ID(`-`=本账号)  立即测试\n"
+            "`/test` 目标 `|` 文本(多条用`||`) `|` 账号别名 `|` 消息延迟(`-`=无延迟) `|` 发言ID(`-`=本账号)  立即测试\n\n"
+            "—— *时间调整* ——\n"
             "`/nextinterval ID` 查看某个间隔任务剩余时间；`/nextinterval all` 查看全部间隔任务\n"
             "`/delaynext ID | 秒数/间隔` 临时调整间隔任务的下一次执行时间\n"
             "占位符 `-` 表示不设置；编辑占位符 `_` 表示不修改字段；发言ID=none 可禁用 send-as；消息延迟=多条消息之间等待时间\n\n"
@@ -1236,7 +1237,7 @@ async def main():
         if not admin_ok(e): return
         if not tasks_state["tasks"] and not template_tasks_state["tasks"]:
             await e.reply("暂无任务。"); return
-        lines = []
+        normal_lines = []
         for t in tasks_state["tasks"]:
             normalize_task_entry(t)
             preview = t["messages"][0][:40] + ("..." if len(t["messages"][0]) > 40 else "")
@@ -1245,11 +1246,12 @@ async def main():
             delay_txt = f" 消息延迟:{delay_val}s" if delay_val else ""
             send_as_txt = f" {await resolve_send_as_display(t)}"
             next_info = describe_next_run(t)
-            lines.append(
+            normal_lines.append(
                 f"#{t['id']} [{'ON' if t.get('enabled', True) else 'OFF'}] "
                 f"[{format_accounts(t)}] {t['cron']} -> {t['target']} | {preview}{extra}{delay_txt}{send_as_txt} "
                 f"｜备注:{(t.get('remark') or '无')} ｜下次：{next_info}"
             )
+        template_lines = []
         for tt in template_tasks_state["tasks"]:
             normalize_template_task_entry(tt)
             name, target, preview = template_brief(tt)
@@ -1257,12 +1259,19 @@ async def main():
             delay_txt = f" 消息延迟:{delay_val}s" if delay_val else ""
             send_as_txt = f" {await resolve_send_as_display(tt)}"
             next_info = describe_template_next_run(tt)
-            lines.append(
+            template_lines.append(
                 f"#T{tt['id']} [{'ON' if tt.get('enabled', True) else 'OFF'}] "
                 f"[{format_accounts(tt)}] 模板:{name}(#{tt['template_id']}) -> {target} | {preview}{delay_txt}{send_as_txt} "
                 f"｜备注:{(tt.get('remark') or '无')} ｜下次：{next_info}"
             )
-        await e.reply("📋 任务列表：\n" + "\n".join(lines))
+        blocks = []
+        if normal_lines:
+            blocks.append("\n".join(normal_lines))
+        if template_lines:
+            blocks.append("\n".join(template_lines))
+        content = "\n\n\n".join(blocks)
+        formatted = content.replace("\n", "\n\n") if content else ""
+        await e.reply("📋 任务列表：\n" + formatted)
 
     @bot.on(events.NewMessage(pattern=r"^/deltask\s+(.+)"))
     async def _(e):
@@ -1382,7 +1391,7 @@ async def main():
         for tpl in templates_state["templates"]:
             msg_preview = tpl["messages"][0][:40] + ("..." if len(tpl["messages"][0]) > 40 else "")
             lines.append(f"#{tpl['id']} {tpl.get('name','(未命名)')} -> {tpl['target']} | {msg_preview}")
-        await e.reply("📐 模板列表：\n" + "\n".join(lines))
+        await e.reply("📐 模板列表：\n" + "\n\n".join(lines))
 
     @bot.on(events.NewMessage(pattern=r"^/addtpl\s+(.+)"))
     async def _(e):
@@ -1520,7 +1529,7 @@ async def main():
                     target = tpl["target"] if tpl else "(模板缺失)"
                     label = f"#T{task['id']}"
                 lines.append(f"{label} [{format_accounts(task)}] -> {target}  {info}")
-            await e.reply("⏱ 间隔任务计划：\n" + "\n".join(lines)); return
+            await e.reply("⏱ 间隔任务计划：\n" + "\n\n".join(lines)); return
         parsed = parse_task_id(arg)
         if not parsed:
             await e.reply("参数需为任务ID或 all，模板任务使用 T 开头，例如 T1。"); return
