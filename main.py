@@ -975,7 +975,7 @@ async def main():
                 else:
                     mtime = "未知"
                 lines.append(f"- {alias}（{info.get('phone','') }） 最后修改:{mtime}")
-            await e.reply("?? 账号列表：\n" + "\n".join(lines))
+            await e.reply("👥 账号列表：\n" + "\n".join(lines))
             return
         alias = alias_arg
         if alias not in data:
@@ -1004,7 +1004,7 @@ async def main():
             channels.append(f"- {ent.id} | {ent.title} | @{ent.username}")
         channels_text = "\n".join(channels) if channels else "无"
         await e.reply(
-            "?? 账号详情：\n"
+            "👥 账号详情：\n"
             f"{fmt_entity(me)}\n"
             f"Premium: {premium}\n"
             "公开可发言频道：\n"
