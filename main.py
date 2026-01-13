@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 tg-auto-checkin: 多账号 + Bot 管理 + 个人号发送 + 定时（上海时区）
@@ -792,7 +792,7 @@ async def main():
     def template_brief(tt):
         tpl = find_template(tt["template_id"])
         if tpl:
-            preview = tpl["messages"][0][:40] + ("..." if len(tpl["messages"][0]) > 40 else "")
+            preview = "||".join(tpl.get("messages", []))
             return tpl.get("name", f"模板{tpl['id']}"), tpl["target"], preview
         return f"模板{tt['template_id']}", "(模板缺失)", "(无文本)"
 
@@ -867,7 +867,7 @@ async def main():
             "账号别名支持 `a,b,c` 多账号（需发言ID为空或 none）；单账号时多ID发言时发言ID可用逗号分隔多个ID\n\n"
             "—— *时间调整* ——\n"
             "`/nextinterval ID` 查看某个间隔任务剩余时间；`/nextinterval all` 查看全部间隔任务\n"
-            "`/delaynext ID | 秒数/间隔` 临时调整间隔任务的下一次执行时间\n"
+            "`/delaynext ID | 秒数/间隔` 临时调整间隔任务的下一次执行时间\n\n"
             "—— *任务模板* ——\n"
             "`/listtpl` 查看模板列表\n"
             "`/addtpl` 名称 `|` 目标 `|` 文本(多条用`||`)\n"
@@ -1239,7 +1239,7 @@ async def main():
         normal_lines = []
         for t in tasks_state["tasks"]:
             normalize_task_entry(t)
-            preview = t["messages"][0][:40] + ("..." if len(t["messages"][0]) > 40 else "")
+            preview = "||".join(t.get("messages", []))
             extra = f" 共{len(t['messages'])}条" if len(t["messages"]) > 1 else ""
             delay_val = t.get("delay", 0)
             delay_txt = f" 消息延迟:{delay_val}s" if delay_val else ""
@@ -1388,7 +1388,7 @@ async def main():
             await e.reply("暂无模板。"); return
         lines = []
         for tpl in templates_state["templates"]:
-            msg_preview = tpl["messages"][0][:40] + ("..." if len(tpl["messages"][0]) > 40 else "")
+            msg_preview = "||".join(tpl.get("messages", []))
             lines.append(f"#{tpl['id']} {tpl.get('name','(未命名)')} -> {tpl['target']} | {msg_preview}")
         await e.reply("📐 模板列表：\n" + "\n\n".join(lines))
 
@@ -1651,3 +1651,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n已退出。")
+
