@@ -45,7 +45,7 @@ ensure(["telethon", "apscheduler"])
 
 from telethon import TelegramClient, events
 from telethon.errors import SessionPasswordNeededError
-from telethon.tl.types import UserStatusOnline, UserStatusOffline
+from telethon.tl.types import UserStatusOnline, UserStatusOffline, Channel
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -881,7 +881,7 @@ async def main():
             "`/adduser 别名 | 手机号(含国家码)`\n"
             "`/code 别名 | 验证码`\n"
             "`/pass 别名 | 二步验证密码(如需要)`\n"
-            "`/listusers` 列出账号\n"
+            "`/listusers` 列出账号，可加上别名查看详细信息\n"
             "`/removeuser 别名` 移除账号\n\n"
             "—— *状态/查询* ——\n"
             "`/status` 查看所有账号状态\n"
@@ -958,19 +958,58 @@ async def main():
         except Exception as ex:
             await e.reply(f"❌ 二步验证失败：{ex}")
 
-    @bot.on(events.NewMessage(pattern=r"^/listusers$"))
+    @bot.on(events.NewMessage(pattern=r"^/listusers(?:\s+(.+))?$"))
     async def _(e):
         if not admin_ok(e): return
+        alias_arg = (e.pattern_match.group(1) or "").strip()
         data = ensure_accounts()["users"]
         if not data:
             await e.reply("暂无已登录账号。"); return
-        lines = []
-        for alias, info in data.items():
-            sess = Path(info["session_file"])
-            mtime = datetime.fromtimestamp(sess.stat().st_mtime).astimezone(SH_TZ).strftime("%Y-%m-%d %H:%M:%S") if sess.exists() else "N/A"
-            lines.append(f"- {alias}（{info.get('phone','') }） session:{sess.name} mtime:{mtime}")
-        await e.reply("👥 账号列表：\n" + "\n".join(lines))
-
+        if not alias_arg:
+            lines = []
+            for alias, info in data.items():
+                sess = Path(info["session_file"])
+                if sess.exists():
+                    dt = datetime.fromtimestamp(sess.stat().st_mtime).astimezone(SH_TZ)
+                    mtime = f"{dt.year}年{dt.month:02d}月{dt.day:02d}日 {dt:%H:%M:%S}"
+                else:
+                    mtime = "未知"
+                lines.append(f"- {alias}（{info.get('phone','') }） 最后修改:{mtime}")
+            await e.reply("?? 账号列表：\n" + "\n".join(lines))
+            return
+        alias = alias_arg
+        if alias not in data:
+            await e.reply("未找到该别名。"); return
+        client = await get_or_start_client(cfg["api_id"], cfg["api_hash"], alias)
+        if not await client.is_user_authorized():
+            await e.reply("该账号未登录。"); return
+        me = await client.get_me()
+        premium = "是" if getattr(me, "premium", False) else "否"
+        channels = []
+        async for dialog in client.iter_dialogs():
+            ent = dialog.entity
+            if not isinstance(ent, Channel):
+                continue
+            if not getattr(ent, "broadcast", False):
+                continue
+            if not getattr(ent, "username", None):
+                continue
+            if getattr(ent, "creator", False):
+                can_post = True
+            else:
+                rights = getattr(ent, "admin_rights", None)
+                can_post = bool(rights and (getattr(rights, "post_messages", False) or getattr(rights, "post", False)))
+            if not can_post:
+                continue
+            channels.append(f"- {ent.id} | {ent.title} | @{ent.username}")
+        channels_text = "\n".join(channels) if channels else "无"
+        await e.reply(
+            "?? 账号详情：\n"
+            f"{fmt_entity(me)}\n"
+            f"Premium: {premium}\n"
+            "公开可发言频道：\n"
+            f"{channels_text}"
+        )
     @bot.on(events.NewMessage(pattern=r"^/removeuser\s+(.+)"))
     async def _(e):
         if not admin_ok(e): return
@@ -1652,6 +1691,7 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n已退出。")
+
 
 
 
