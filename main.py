@@ -854,7 +854,7 @@ async def main():
 
      # 漂亮的帮助
     def help_card():
-        return (
+        text = (
             "🧭 *签到机器人 · 管理菜单*\n"
             "—— *任务管理* ——\n"
             "`/listtasks`  列出任务\n"
@@ -893,6 +893,7 @@ async def main():
             "`100s` / `380m` / `36h`  表示纯间隔定时（秒/分钟/小时）\n"
             "支持 6 字段（含秒）的 cron 表达式，也兼容 `100s` 这类间隔格式（单位：s/m/h）；目标可用：@用户名 / t.me 链接 / -100群ID / 数字用户ID（需在会话列表） / me\n"
         )
+        return re.sub(r"(?<!\w)/(?=[A-Za-z])", "/\u200b", text)
 
     @bot.on(events.NewMessage(pattern=r"^/(start|help)$"))
     async def _(e):
@@ -1653,4 +1654,5 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n已退出。")
+
 
