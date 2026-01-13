@@ -1268,7 +1268,7 @@ async def main():
             blocks.append("\n".join(normal_lines))
         if template_lines:
             blocks.append("\n".join(template_lines))
-        content = "\n".join(blocks)
+        content = "\n\n".join(blocks)
         formatted = content.replace("\n", "\n\n") if content else ""
         await e.reply("📋 任务列表：\n" + formatted)
 
