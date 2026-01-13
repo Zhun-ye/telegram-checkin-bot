@@ -19,6 +19,7 @@ import re
 import sys
 import subprocess
 import ast
+from typing import Any
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -311,22 +312,29 @@ def fmt_entity(ent):
     kind = ent.__class__.__name__
     return f"{name} {uname} | id={eid} | type={kind}"
 
+def ensure_single_entity(entity, target: str):
+    if isinstance(entity, list):
+        if len(entity) == 1:
+            return entity[0]
+        raise ValueError(f"目标 `{target}` 解析到多个对象，请使用 @用户名 / t.me 链接 / -100 群ID 精确指定。")
+    return entity
+
 async def resolve_entity(client: TelegramClient, t: str):
     t = str(t).strip()
     if t.lower() in ("me", "self"):  # 收藏夹
-        return await client.get_entity("me")
+        return ensure_single_entity(await client.get_entity("me"), t)
     if t.startswith("@") or "t.me/" in t:
-        return await client.get_entity(t)
+        return ensure_single_entity(await client.get_entity(t), t)
     if t.startswith("-100") or (t.startswith("-") and t[1:].isdigit()):
-        return await client.get_entity(int(t))
+        return ensure_single_entity(await client.get_entity(int(t)), t)
     if t.isdigit():
         target_id = int(t)
         async for dialog in client.iter_dialogs():
             ent = dialog.entity
             if getattr(ent, "id", None) == target_id:
-                return ent
+                return ensure_single_entity(ent, t)
         raise ValueError(f"无法通过数字ID {t} 找到对象；请先与其建立会话，或改用 @用户名 / t.me 链接 / -100群ID。")
-    return await client.get_entity(t)
+    return ensure_single_entity(await client.get_entity(t), t)
 
 async def resolve_send_as(client: TelegramClient, target):
     if target in (None, "", FIELD_PLACEHOLDER):
@@ -548,7 +556,9 @@ async def send_with_user(api_id, api_hash, alias: str, target: str, texts, delay
         for idx, text in enumerate(messages):
             if not text:
                 continue
-            kwargs = {"send_as": send_as_peer} if send_as_peer else {}
+            kwargs: dict[str, Any] = {}
+            if send_as_peer:
+                kwargs["send_as"] = send_as_peer
             await client.send_message(ent, text, **kwargs)
             if delay and idx < len(messages) - 1:
                 await asyncio.sleep(delay)
@@ -597,7 +607,7 @@ async def main():
 
     # 机器人
     bot = TelegramClient(BOT_SESSION, cfg["api_id"], cfg["api_hash"])
-    await bot.start(bot_token=cfg["bot_token"])
+    await bot.start(bot_token=cfg["bot_token"])  # type: ignore[reportGeneralTypeIssues]
 
     log_channel = cfg.get("log_channel")
     log_enabled = bool(log_channel) and cfg.get("log_enabled", True)
@@ -607,10 +617,10 @@ async def main():
             return int(target.strip())
         return target
 
-    log_channel_target = parse_log_target(log_channel)
+    log_channel_target: int | str | None = parse_log_target(log_channel)
 
     async def send_log_message(text: str):
-        if not log_enabled or not text:
+        if not log_enabled or not text or not log_channel_target:
             return
         try:
             await bot.send_message(log_channel_target, text)
@@ -786,6 +796,58 @@ async def main():
             return tpl.get("name", f"模板{tpl['id']}"), tpl["target"], preview
         return f"模板{tt['template_id']}", "(模板缺失)", "(无文本)"
 
+    send_as_name_cache: dict[str, str] = {}
+
+    def entity_display_name(ent) -> str:
+        uname = getattr(ent, "username", None)
+        if uname:
+            return f"@{uname}"
+        title = getattr(ent, "title", None)
+        if title:
+            return str(title)
+        first = getattr(ent, "first_name", "") or ""
+        last = getattr(ent, "last_name", "") or ""
+        name = f"{first} {last}".strip()
+        return name or str(getattr(ent, "id", ""))
+
+    async def resolve_send_as_display(task: dict) -> str:
+        send_as_val = task.get("send_as")
+        if send_as_val in (None, SEND_AS_DISABLE):
+            return format_send_as(send_as_val)
+        aliases = iter_task_accounts(task)
+        if not aliases:
+            return format_send_as(send_as_val)
+        alias = aliases[0]
+        try:
+            client = await get_or_start_client(cfg["api_id"], cfg["api_hash"], alias)
+            if not await client.is_user_authorized():
+                return format_send_as(send_as_val)
+        except Exception:
+            return format_send_as(send_as_val)
+
+        async def resolve_one(val) -> str:
+            sval = str(val).strip()
+            if not sval or not sval.lstrip("-").isdigit():
+                return sval
+            cached = send_as_name_cache.get(sval)
+            if cached:
+                return f"{sval}({cached})"
+            try:
+                ent = await resolve_entity(client, sval)
+            except Exception:
+                return sval
+            disp = entity_display_name(ent)
+            if disp:
+                send_as_name_cache[sval] = disp
+                return f"{sval}({disp})"
+            return sval
+
+        if isinstance(send_as_val, list):
+            rendered = [await resolve_one(x) for x in send_as_val]
+            return f"发言:{','.join(rendered)}"
+        rendered = await resolve_one(send_as_val)
+        return f"发言:{rendered}" if rendered else format_send_as(send_as_val)
+
     # 权限
     ADMINS = set(cfg["admin_ids"])
     def admin_ok(event): return event.sender_id in ADMINS
@@ -918,7 +980,7 @@ async def main():
         # 停止并删除会话文件
         try:
             if alias in CLIENTS:
-                await CLIENTS[alias].disconnect()
+                await CLIENTS[alias].disconnect()  # type: ignore[reportGeneralTypeIssues]
                 CLIENTS.pop(alias, None)
         except Exception:
             pass
@@ -1181,7 +1243,7 @@ async def main():
             extra = f" 共{len(t['messages'])}条" if len(t["messages"]) > 1 else ""
             delay_val = t.get("delay", 0)
             delay_txt = f" 消息延迟:{delay_val}s" if delay_val else ""
-            send_as_txt = f" {send_as_text(t.get('send_as'))}"
+            send_as_txt = f" {await resolve_send_as_display(t)}"
             next_info = describe_next_run(t)
             lines.append(
                 f"#{t['id']} [{'ON' if t.get('enabled', True) else 'OFF'}] "
@@ -1193,7 +1255,7 @@ async def main():
             name, target, preview = template_brief(tt)
             delay_val = tt.get("delay", 0)
             delay_txt = f" 消息延迟:{delay_val}s" if delay_val else ""
-            send_as_txt = f" {send_as_text(tt.get('send_as'))}"
+            send_as_txt = f" {await resolve_send_as_display(tt)}"
             next_info = describe_template_next_run(tt)
             lines.append(
                 f"#T{tt['id']} [{'ON' if tt.get('enabled', True) else 'OFF'}] "
@@ -1574,7 +1636,7 @@ async def main():
     print("✅ 管理Bot已启动（上海时区）。用管理员账号给Bot发 /help 查看菜单。")
     await send_log_message("✅ 管理Bot已启动。")
 
-    await bot.run_until_disconnected()
+    await bot.run_until_disconnected()  # type: ignore[reportGeneralTypeIssues]
 
 if __name__ == "__main__":
     try:

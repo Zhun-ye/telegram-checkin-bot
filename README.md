@@ -12,8 +12,8 @@
 - 📝 **任务备注**：每个任务可带备注，方便区分
 - 📊 **状态监控**：随时查看账号实时状态（在线/离线/最近上线）
 - 🔐 **独立运行环境**：自动创建虚拟环境，依赖与系统隔离
-- ⚙️ **一键部署**：`install.sh` 安装并注册 systemd 服务，开机自启
-- 📦 **干净卸载**：`uninstall.sh` 移除服务与数据
+- ⚙️ **一键部署**：`setup.sh` 支持直接安装或 Docker 安装
+- 📦 **干净卸载**：`setup.sh` 支持卸载服务与数据
 
 ---
 
@@ -27,7 +27,7 @@ cd telegram-checkin-bot
 
 ### 2. 一键安装
 ```bash
-sudo bash install.sh
+sudo bash setup.sh
 ```
 
 脚本会完成：
@@ -45,16 +45,23 @@ sudo bash install.sh
 
 ## 🛠 管理脚本
 
-仓库提供 `manage.sh`，简化日常管理：
+仓库提供 `setup.sh`，可在菜单内选择「直接安装 → 管理」并执行：
+`start`/`stop`/`restart`/`status`/`logs`/`edit`/`update`。
 
-```bash
-bash manage.sh start     # 启动服务
-bash manage.sh stop      # 停止服务
-bash manage.sh restart   # 重启服务
-bash manage.sh status    # 查看状态
-bash manage.sh logs      # 实时日志
-bash manage.sh edit      # 编辑 config.json
-bash manage.sh update    # 从仓库更新到 /opt 并重启
+示例菜单（简化）：
+```text
+请选择安装模式：
+  1) 直接安装（systemd）
+  2) Docker 安装
+
+直接安装功能：
+  1) 安装
+  2) 管理（start/stop/restart/status/logs/edit/update）
+  3) 卸载
+
+Docker 功能：
+  1) 安装
+  2) 更新已安装容器
 ```
 
 ---
@@ -100,12 +107,12 @@ bash manage.sh update    # 从仓库更新到 /opt 并重启
 
 ## 🐳 Docker 部署
 
-也可以通过 Docker 运行（初次会根据环境变量生成 `config.json`）。提供脚本 `./docker-install.sh`，会交互式询问 `API_ID`/`API_HASH`/`BOT_TOKEN`/`ADMIN_IDS`、容器名称与数据目录，然后执行 `docker build` + `docker run`。你可以多次运行该脚本，为不同容器指定不同名称及数据目录，从而实现多实例。
+也可以通过 Docker 运行（初次会根据环境变量生成 `config.json`）。使用 `setup.sh` 选择「Docker 安装」，会交互式询问 `API_ID`/`API_HASH`/`BOT_TOKEN`/`ADMIN_IDS`、容器名称与数据目录，然后执行 `docker build` + `docker run`。你可以多次运行该脚本，为不同容器指定不同名称及数据目录，从而实现多实例。
 
 也可手动执行（等同于脚本步骤）：
 
 ```bash
-docker build -t tg-checkin-bot .
+docker build -t tg-checkin-bot -f docker/Dockerfile .
 docker run -d --name tg-checkin \
   -e API_ID=123456 \
   -e API_HASH=your_api_hash \
@@ -153,17 +160,13 @@ docker run -d --name tg-checkin \
    ```
 
 3. **修改配置后如何生效？**  
-   - 用 `manage.sh restart` 重启服务。
+   - 用 `setup.sh` 的「直接安装 → 管理 → restart」重启服务。
 
 ---
 
 ## ❌ 卸载
 
-```bash
-sudo bash uninstall.sh
-```
-
-会移除 systemd 服务，删除 `/opt/tg-checkin` 与用户 `tgcheckin`。  
+使用 `setup.sh` 选择「直接安装 → 卸载」，会移除 systemd 服务，删除 `/opt/tg-checkin` 与用户 `tgcheckin`。  
 如要保留数据，可手动备份 `config.json / tasks.json / accounts.json / *.session`。
 
 ---

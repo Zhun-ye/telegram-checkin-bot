@@ -7,8 +7,8 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR ${APP_DIR}
 
-COPY main.py README.md manage.sh install.sh uninstall.sh ${APP_DIR}/
-COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+COPY main.py README.md ${APP_DIR}/
+COPY docker/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 RUN set -eux; \
     apt-get update; \
