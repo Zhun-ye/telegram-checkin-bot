@@ -18,6 +18,7 @@ import os
 import re
 import sys
 import subprocess
+import ast
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -121,6 +122,18 @@ def normalize_send_as(task: dict) -> bool:
     """统一 send_as 为列表或单值；支持旧字符串逗号分隔。"""
     changed = False
     send_as_raw = task.get("send_as")
+    if isinstance(send_as_raw, str):
+        raw_txt = send_as_raw.strip()
+        if raw_txt.startswith("[") and raw_txt.endswith("]"):
+            try:
+                parsed = ast.literal_eval(raw_txt)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, list):
+                send_as_list = [str(x).strip() for x in parsed if str(x).strip()]
+                task["send_as"] = send_as_list
+                changed = True
+                send_as_raw = send_as_list
     if isinstance(send_as_raw, list):
         send_as_list = [str(x).strip() for x in send_as_raw if str(x).strip()]
         if send_as_list != send_as_raw:
@@ -434,6 +447,8 @@ def normalize_task_entry(task: dict) -> bool:
         changed = True
     if send_as_raw is None:
         send_as_val = None
+    elif isinstance(send_as_raw, list):
+        send_as_val = [str(x).strip() for x in send_as_raw if str(x).strip()]
     else:
         send_as_txt = str(send_as_raw).strip()
         if not send_as_txt or send_as_txt == FIELD_PLACEHOLDER:
@@ -1167,10 +1182,11 @@ async def main():
             delay_val = t.get("delay", 0)
             delay_txt = f" 消息延迟:{delay_val}s" if delay_val else ""
             send_as_txt = f" {send_as_text(t.get('send_as'))}"
+            next_info = describe_next_run(t)
             lines.append(
                 f"#{t['id']} [{'ON' if t.get('enabled', True) else 'OFF'}] "
                 f"[{format_accounts(t)}] {t['cron']} -> {t['target']} | {preview}{extra}{delay_txt}{send_as_txt} "
-                f"｜备注:{(t.get('remark') or '无')}"
+                f"｜备注:{(t.get('remark') or '无')} ｜下次：{next_info}"
             )
         for tt in template_tasks_state["tasks"]:
             normalize_template_task_entry(tt)
@@ -1311,7 +1327,7 @@ async def main():
         if not admin_ok(e): return
         try:
             body = e.pattern_match.group(1).strip()
-            parts = [x.strip() for x in body.split("|")]
+            parts = split_command_fields(body)
             if len(parts) < 3:
                 await e.reply("格式：`/addtpl 名称 | 目标 | 文本(多条用||)`"); return
             name, target, text_field = parts[0], parts[1], parts[2]
@@ -1330,7 +1346,7 @@ async def main():
         if not admin_ok(e): return
         try:
             body = e.pattern_match.group(1).strip()
-            parts = [x.strip() for x in body.split("|")]
+            parts = split_command_fields(body)
             if len(parts) < 4 or not parts[0].isdigit():
                 await e.reply("格式：`/edittpl ID | 名称 | 目标 | 文本(多条用||)`，字段用 `_` 可不修改。"); return
             tid = int(parts[0]); name = parts[1]; target = parts[2]; text_field = parts[3]
