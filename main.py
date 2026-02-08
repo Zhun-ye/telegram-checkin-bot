@@ -101,6 +101,35 @@ def parse_aliases(value) -> list[str]:
     aliases = [str(x).strip() for x in raw if str(x).strip()]
     return aliases
 
+def split_text(text: str, limit: int = 3500) -> list[str]:
+    if not text:
+        return [""]
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    buf = ""
+    for line in text.splitlines():
+        candidate = f"{buf}\n{line}" if buf else line
+        if len(candidate) <= limit:
+            buf = candidate
+            continue
+        if buf:
+            chunks.append(buf)
+            buf = ""
+        if len(line) <= limit:
+            buf = line
+        else:
+            for i in range(0, len(line), limit):
+                chunks.append(line[i:i + limit])
+            buf = ""
+    if buf:
+        chunks.append(buf)
+    return chunks
+
+async def reply_long(event, text: str, parse_mode: str | None = None, limit: int = 3500):
+    for part in split_text(text, limit=limit):
+        await event.reply(part, parse_mode=parse_mode)
+
 def normalize_accounts(task: dict) -> bool:
     """统一任务的账号字段：accounts 列表 + account 逗号串。"""
     changed = False
@@ -1310,7 +1339,7 @@ async def main():
             blocks.append("\n".join(template_lines))
         content = "\n".join(blocks)
         formatted = content.replace("\n", "\n\n") if content else ""
-        await e.reply("📋 任务列表：\n" + formatted)
+        await reply_long(e, "📋 任务列表：\n" + formatted)
 
     @bot.on(events.NewMessage(pattern=r"^/deltask\s+(.+)"))
     async def _(e):
@@ -1649,7 +1678,7 @@ async def main():
             me, online, last = await user_status(client)
             last_txt = last.astimezone(SH_TZ).strftime("%Y-%m-%d %H:%M:%S") if last else "未知"
             lines.append(f"- {alias}: {'在线' if online else '离线'}  最近在线: {last_txt}  {fmt_entity(me)}")
-        await e.reply("\n".join(lines))
+        await reply_long(e, "\n".join(lines))
 
     @bot.on(events.NewMessage(pattern=r"^/me\s+(.+)"))
     async def _(e):
@@ -1691,7 +1720,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n已退出。")
-
-
-
 
