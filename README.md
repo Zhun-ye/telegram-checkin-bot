@@ -95,12 +95,14 @@ Docker 功能：
 /addtpltask 模板ID | CRON/间隔 | 账号别名 | 备注 | 消息延迟s(-=无) | 发言ID(-=本账号/none=禁用)
 ```
 > CRON 支持 6 字段（秒 分 时 日 月 周），也可直接写 `100s` / `380m` / `36h` 表示每隔一定秒/分/小时执行一次。模板任务 ID 以 `T` 开头（例如 `T1`），在 `/edittask`、`/deltask`、`/toggle`、`/nextinterval`、`/delaynext` 中都可以直接使用。
+> 论坛群可在目标后追加 `?topic=话题ID` 精确发送到指定话题，例如 `-1001234567890?topic=456`、`@groupname?topic=456`。未追加时保持原行为；`topic=1` 视为普通发送到 General 话题。
 
 ### 状态与查询
 ```
 /status                            # 查看所有账号状态
 /me 别名                           # 查看某个账号信息
 /whois 目标                        # 解析目标信息
+/topics 目标 | 账号别名             # 列出论坛群话题 ID、名称
 ```
 
 ---

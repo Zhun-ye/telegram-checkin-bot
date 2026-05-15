@@ -18,6 +18,7 @@ import os
 import re
 import sys
 import ast
+from urllib.parse import parse_qsl, urlencode
 from typing import Any
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -31,6 +32,7 @@ try:
     from telethon import TelegramClient, events
     from telethon.errors import SessionPasswordNeededError
     from telethon.tl.types import UserStatusOnline, UserStatusOffline, Channel
+    from telethon.tl.functions.messages import GetForumTopicsRequest
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
     from apscheduler.triggers.cron import CronTrigger
     from apscheduler.triggers.interval import IntervalTrigger
@@ -322,6 +324,28 @@ def split_command_fields(body: str):
     parts = [x.strip().replace(DOUBLE_PIPE_PLACEHOLDER, "||") for x in masked.split("|")]
     return parts
 
+def parse_target_topic(target: str):
+    """解析 target?topic=123 形式，返回纯目标和话题ID。"""
+    raw = str(target).strip()
+    if "?" not in raw:
+        return raw, None
+    base, query = raw.split("?", 1)
+    params = parse_qsl(query, keep_blank_values=True)
+    topic_vals = [v.strip() for k, v in params if k.lower() == "topic" and v.strip()]
+    if not topic_vals:
+        return raw, None
+    topic_txt = topic_vals[-1]
+    if not topic_txt.isdigit():
+        raise ValueError("话题ID需为数字，例如 `-1001234567890?topic=456`。")
+    topic_id = int(topic_txt)
+    rest_params = [(k, v) for k, v in params if k.lower() != "topic"]
+    clean_target = base.strip()
+    if rest_params:
+        clean_target = f"{clean_target}?{urlencode(rest_params)}"
+    if not clean_target:
+        raise ValueError("目标不能为空。")
+    return clean_target, topic_id if topic_id > 1 else None
+
 def fmt_entity(ent):
     name = getattr(ent, "title", None) or \
            (" ".join([getattr(ent, "first_name", "") or "", getattr(ent, "last_name", "") or ""]).strip() or "(无名)")
@@ -562,7 +586,8 @@ async def send_with_user(api_id, api_hash, alias: str, target: str, texts, delay
         client = await get_or_start_client(api_id, api_hash, alias)
         if not await client.is_user_authorized():
             raise RuntimeError(f"账号 {alias} 未登录，请先在 Bot 中完成 /adduser → /code（→ /pass）流程。")
-        ent = await resolve_entity(client, target)
+        clean_target, topic_id = parse_target_topic(target)
+        ent = await resolve_entity(client, clean_target)
         if isinstance(texts, str):
             messages = [texts]
         else:
@@ -575,6 +600,8 @@ async def send_with_user(api_id, api_hash, alias: str, target: str, texts, delay
             if not text:
                 continue
             kwargs: dict[str, Any] = {}
+            if topic_id:
+                kwargs["reply_to"] = topic_id
             if send_as_peer:
                 kwargs["send_as"] = send_as_peer
             await client.send_message(ent, text, **kwargs)
@@ -883,6 +910,7 @@ async def main():
             "`/test 目标 | 命令(多条用||) | 账号别名 | 消息延迟(-=无延迟) | 发言ID(-=本账号)` 立即测试\n"
             "占位符 - 表示不设置；编辑占位符 _ 表示不修改字段；发言ID=none 可禁用 send-as；消息延迟=多条消息之间等待时间；\n"
             "账号别名支持 a,b,c 多账号(需发言ID为空或 none)；单账号时多ID发言时发言ID可用逗号分隔多个ID；\n\n"
+            "论坛群话题可在目标后追加 `?topic=话题ID`，例如 `-1001234567890?topic=456`；\n\n"
             "—— *时间调整* ——\n"
             "`/nextinterval ID` 查看某个任务间隔时间；\n"
             "`/nextinterval all` 查看全部任务间隔时间；\n"
@@ -905,11 +933,12 @@ async def main():
             "`/status` 查看所有账号状态\n"
             "`/me 别名` 查看某账号登录信息\n"
             "`/whois 目标` 解析目标信息\n\n"
+            "`/topics 目标 | 账号别名` 列出论坛群话题ID和名称\n\n"
             "*CRON 示例*\n"
             "`0 0 9 * * *`  每天 09:00（秒 分 时 日 月 周）\n"
             "`30 */10 * * * *`  每 10 分钟执行，并在周期内第 30 秒触发\n"
             "`100s / 380m / 36h`  表示纯间隔定时（秒/分钟/小时）\n"
-            "支持 6 字段（含秒）的 cron 表达式，也兼容 100s 这类间隔格式（单位：s/m/h）；目标可用：@用户名 / t.me 链接 / -100群ID / 数字用户ID（需在会话列表） / me\n"
+            "支持 6 字段（含秒）的 cron 表达式，也兼容 100s 这类间隔格式（单位：s/m/h）；目标可用：@用户名 / t.me 链接 / -100群ID / 数字用户ID（需在会话列表） / me；论坛群话题使用 `目标?topic=话题ID`\n"
         )
     @bot.on(events.NewMessage(pattern=r"^/(start|help)$"))
     async def _(e):
@@ -1698,6 +1727,55 @@ async def main():
             await e.reply("🔎 解析成功：\n" + fmt_entity(ent))
         except Exception as ex:
             await e.reply(f"❌ 解析失败：{ex}")
+
+    @bot.on(events.NewMessage(pattern=r"^/topics\s+(.+)"))
+    async def _(e):
+        if not admin_ok(e): return
+        try:
+            body = e.pattern_match.group(1).strip()
+            parts = split_command_fields(body)
+            if len(parts) < 2:
+                await e.reply("格式：`/topics 目标 | 账号别名`", parse_mode="md"); return
+            target, alias = parts[0], parts[1]
+            accounts_data = ensure_accounts()["users"]
+            if alias not in accounts_data:
+                await e.reply(f"账号别名不存在：{alias}"); return
+            client = await get_or_start_client(cfg["api_id"], cfg["api_hash"], alias)
+            if not await client.is_user_authorized():
+                await e.reply("该账号未登录。"); return
+            clean_target, _topic_id = parse_target_topic(target)
+            ent = await resolve_entity(client, clean_target)
+            if not getattr(ent, "forum", False):
+                await e.reply("该目标不是已开启话题的论坛群。"); return
+            peer = await client.get_input_entity(ent)
+            result = await client(GetForumTopicsRequest(
+                peer=peer,
+                offset_date=None,
+                offset_id=0,
+                offset_topic=0,
+                limit=100,
+            ))
+            topics = getattr(result, "topics", []) or []
+            if not topics:
+                await e.reply("未获取到话题列表。"); return
+            lines = [f"🧵 话题列表：{getattr(ent, 'title', clean_target)}"]
+            for topic in topics:
+                title = getattr(topic, "title", "") or "(未命名)"
+                tid = getattr(topic, "id", None)
+                flags = []
+                if tid == 1:
+                    flags.append("General")
+                if getattr(topic, "pinned", False):
+                    flags.append("置顶")
+                if getattr(topic, "closed", False):
+                    flags.append("关闭")
+                if getattr(topic, "hidden", False):
+                    flags.append("隐藏")
+                suffix = f" [{' / '.join(flags)}]" if flags else ""
+                lines.append(f"- {tid} | {title}{suffix}")
+            await reply_long(e, "\n".join(lines))
+        except Exception as ex:
+            await e.reply(f"❌ 获取话题失败：{ex}")
 
     print("✅ 管理Bot已启动（上海时区）。用管理员账号给Bot发 /help 查看菜单。")
     await send_log_message("✅ 管理Bot已启动。")
