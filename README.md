@@ -21,7 +21,7 @@
 
 ### 1. 克隆仓库
 ```bash
-git clone https://github.com/kelenetwork/telegram-checkin-bot.git
+git clone https://github.com/Zhun-ye/telegram-checkin-bot.git
 cd telegram-checkin-bot
 ```
 
