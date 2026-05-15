@@ -9,14 +9,16 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR ${APP_DIR}
 
-COPY main.py README.md ${APP_DIR}/
+COPY requirements.txt ${APP_DIR}/
 COPY --chmod=755 docker/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends tzdata; \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*; \
-    pip install --no-cache-dir telethon apscheduler
+    pip install --no-cache-dir -r requirements.txt
+
+COPY main.py README.md ${APP_DIR}/
 
 VOLUME ["/data"]
 

@@ -34,7 +34,7 @@ sudo bash setup.sh
 - 安装系统依赖（Python3/venv/tzdata/git 等）
 - 创建运行用户 `tgcheckin`
 - 部署到 `/opt/tg-checkin`
-- 创建虚拟环境并安装 `telethon`、`apscheduler`
+- 创建虚拟环境并按 `requirements.txt` 安装依赖
 - 注册 `systemd` 服务，开机自启
 - 首次运行 `main.py` 引导你输入：
   - `api_id` / `api_hash`（[my.telegram.org](https://my.telegram.org) 申请）

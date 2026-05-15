@@ -7,7 +7,7 @@ tg-auto-checkin: 多账号 + Bot 管理 + 个人号发送 + 定时（上海时�
 - 实时：/status（全部账号） /me <alias> /whois <target>
 - CRON：6字段 crontab（含秒）或间隔表达式（100s/380m/36h）；时区 Asia/Shanghai
 - 任务字段：target/cron/messages/account/remark/delay/send_as/enabled
-依赖：telethon, apscheduler（自动安装，兼容 PEP 668）
+依赖：requirements.txt
 数据：config.json / accounts.json / tasks.json
 会话文件：user-<alias>.session（个人号），bot.session（机器人）
 """
@@ -17,7 +17,6 @@ import json
 import os
 import re
 import sys
-import subprocess
 import ast
 from typing import Any
 from datetime import datetime, timedelta
@@ -28,27 +27,17 @@ os.environ.setdefault("LANG", "C.UTF-8")
 os.environ.setdefault("LC_ALL", "C.UTF-8")
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
-# ---------------- 依赖安装（兼容 PEP 668） ----------------
-def ensure(pkgs):
-    for p in pkgs:
-        try:
-            __import__(p)
-        except Exception:
-            print(f"未检测到 {p}，正在安装……")
-            try:
-                subprocess.check_call([sys.executable, "-m", "pip", "install", p])
-            except subprocess.CalledProcessError:
-                print(f"常规安装 {p} 失败，尝试 --break-system-packages ……")
-                subprocess.check_call([sys.executable, "-m", "pip", "install", p, "--break-system-packages"])
-
-ensure(["telethon", "apscheduler"])
-
-from telethon import TelegramClient, events
-from telethon.errors import SessionPasswordNeededError
-from telethon.tl.types import UserStatusOnline, UserStatusOffline, Channel
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
-from apscheduler.triggers.interval import IntervalTrigger
+try:
+    from telethon import TelegramClient, events
+    from telethon.errors import SessionPasswordNeededError
+    from telethon.tl.types import UserStatusOnline, UserStatusOffline, Channel
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    from apscheduler.triggers.cron import CronTrigger
+    from apscheduler.triggers.interval import IntervalTrigger
+except ImportError as exc:
+    print(f"缺少依赖：{exc}", file=sys.stderr)
+    print("请先运行：python -m pip install -r requirements.txt", file=sys.stderr)
+    raise SystemExit(1)
 from zoneinfo import ZoneInfo  # Python3.9+
 
 # ---------------- 常量/文件 ----------------
@@ -1720,4 +1709,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n已退出。")
-

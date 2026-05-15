@@ -84,7 +84,7 @@ direct_install() {
     fi
     source venv/bin/activate
     python -m pip install --upgrade pip
-    pip install telethon apscheduler
+    pip install -r requirements.txt
   "
 
   echo "==> 写入 systemd 服务：/etc/systemd/system/${SERVICE_NAME}.service"
